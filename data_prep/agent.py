@@ -24,7 +24,7 @@ def search_datasets(query: str) -> str:
         # Search for datasets using Tavily
         response = tavily_client.search(
             query=query,
-            search_depth="basic",
+            search_depth="advanced",
             max_results=5,
             include_domains=["kaggle.com", "huggingface.co"]
         )
@@ -107,7 +107,6 @@ def download_huggingface_dataset(dataset_name: str) -> str:
 
 async def main():
     user_query = input("Please enter your problem statement: ")
-    dataset_presense = input("Is the dataset already available? (yes/no): ").strip().lower()
 
     root_agent = Agent(
         model=LiteLlm(model="openai/gpt-4o-mini"),
@@ -115,7 +114,6 @@ async def main():
         description='An expert agent who finds and downloads datasets based on user requirements',
         instruction=f"""
         User Query: {user_query}
-        Dataset Available: {dataset_presense}
 
         You are an expert dataset creator. Your task is to fetch high-quality datasets for the user.
 
