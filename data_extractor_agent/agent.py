@@ -7,8 +7,10 @@ from datasets import load_dataset
 from dotenv import load_dotenv
 import kagglehub
 from pathlib import Path
+import shutil
 import os
 import sys
+import json
 from tavily import TavilyClient
 
 load_dotenv()
@@ -57,12 +59,12 @@ def download_kaggle_dataset(dataset_name: str) -> str:
         # Download dataset - kagglehub downloads to cache and returns the path
         download_path = kagglehub.dataset_download(dataset_name)
 
-        # Create datasets directory and copy there
-        save_dir = Path.cwd() / "datasets" / dataset_name.replace("/", "_")
+        # Create datasets directory with dataset-specific folder
+        base_dir = Path(__file__).parent.parent / "datasets"
+        save_dir = base_dir / dataset_name.replace("/", "_")
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # Copy from cache to datasets folder
-        import shutil
         source_path = Path(download_path)
         if source_path.exists():
             # Copy all files from download path to save_dir
@@ -72,6 +74,24 @@ def download_kaggle_dataset(dataset_name: str) -> str:
                     shutil.copytree(item, dest, dirs_exist_ok=True)
                 else:
                     shutil.copy2(item, dest)
+
+        # Update JSON file with dataset info
+        home_dir = Path(__file__).parent.parent
+        json_file_path = home_dir / "user_input.json"
+
+        if json_file_path.exists():
+            with open(json_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        data["downloaded_dataset"] = {
+            "source": "kaggle",
+            "dataset_name": dataset_name,
+        }
+
+        with open(json_file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
 
         success_msg = f"Successfully downloaded Kaggle dataset '{dataset_name}' to {save_dir.absolute()}"
         print(f"[SUCCESS] {success_msg}", flush=True)
@@ -84,9 +104,10 @@ def download_kaggle_dataset(dataset_name: str) -> str:
 
 def download_huggingface_dataset(dataset_name: str) -> str:
     try:
-        # Create datasets directory in current working directory
-        save_dir = Path.cwd() / "datasets"
-        save_dir.mkdir(parents=True, exist_ok=True)
+        # Create datasets directory with dataset-specific folder
+        base_dir = Path(__file__).parent.parent / "datasets"
+        dataset_path = base_dir / dataset_name.replace("/", "_")
+        dataset_path.mkdir(parents=True, exist_ok=True)
 
         print(f"[INFO] Downloading HuggingFace dataset '{dataset_name}'...", flush=True)
 
@@ -94,8 +115,25 @@ def download_huggingface_dataset(dataset_name: str) -> str:
         dataset = load_dataset(dataset_name)
 
         # Save dataset to disk
-        dataset_path = save_dir / dataset_name.replace("/", "_")
         dataset.save_to_disk(str(dataset_path))
+
+        # Update JSON file with dataset info
+        home_dir = Path(__file__).parent.parent
+        json_file_path = home_dir / "user_input.json"
+
+        if json_file_path.exists():
+            with open(json_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data = {}
+
+        data["downloaded_dataset"] = {
+            "source": "huggingface",
+            "dataset_name": dataset_name,
+        }
+
+        with open(json_file_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4)
 
         success_msg = f"Successfully downloaded HuggingFace dataset '{dataset_name}' to {dataset_path.absolute()}"
         print(f"[SUCCESS] {success_msg}", flush=True)
@@ -107,6 +145,16 @@ def download_huggingface_dataset(dataset_name: str) -> str:
 
 async def main():
     user_query = input("Please enter your problem statement: ")
+    user_query_json = json.dumps({"problem_statement": user_query})
+
+    # Save to JSON file in project directory
+    project_dir = Path(__file__).parent.parent
+    json_file_path = project_dir / "user_input.json"
+
+    with open(json_file_path, 'w', encoding='utf-8') as f:
+        json.dump({"problem_statement": user_query}, f, indent=4)
+
+    print(f"[INFO] User input saved to: {json_file_path}")
 
     root_agent = Agent(
         model=LiteLlm(model="openai/gpt-4o-mini"),
@@ -128,7 +176,11 @@ async def main():
 
         IMPORTANT:
         - Actually call the download functions with the exact dataset names from the search results
-        - Extract the dataset identifier from URLs (e.g., from 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name')
+        - Extract the dataset identifier from URLs:
+          * For Kaggle: ONLY use URLs containing '/datasets/' (NOT '/code/')
+          * From 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name'
+          * For HuggingFace: From 'huggingface.co/datasets/username/dataset-name' extract 'username/dataset-name'
+        - Skip any results that are code notebooks or kernels (URLs containing '/code/' or '/kernels/')
         """,
         tools=[search_datasets, download_kaggle_dataset, download_huggingface_dataset]
     )

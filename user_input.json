@@ -1,0 +1,14 @@
+{
+    "problem_statement": "I am working on a project where I am doing cricket data analysis",
+    "downloaded_dataset": {
+        "source": "kaggle",
+        "dataset_name": "mahendran1/icc-cricket",
+        "save_location": "C:\\Users\\hi\\Documents\\My works and PPTs\\Prompt2ML\\datasets\\mahendran1_icc-cricket"
+    },
+    "preprocessed_dataset": {
+        "output_file": "c:\\Users\\hi\\Documents\\My works and PPTs\\Prompt2ML\\modified_datasets\\Fielding_ODI_preprocessed.csv",
+        "metadata_file": "c:\\Users\\hi\\Documents\\My works and PPTs\\Prompt2ML\\modified_datasets\\Fielding_ODI_preprocessed_metadata.json",
+        "rows": 2340,
+        "columns": 13
+    }
+}
