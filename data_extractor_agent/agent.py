@@ -2,7 +2,8 @@ import asyncio
 from google.adk.agents import Agent
 from google.genai import types
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.runners import InMemoryRunner
+from google.adk.sessions import InMemorySessionService
+from google.adk.runners import Runner
 from datasets import load_dataset
 from dotenv import load_dotenv
 import kagglehub
@@ -144,25 +145,11 @@ def download_huggingface_dataset(dataset_name: str) -> str:
         return error_msg
 
 async def main():
-    user_query = input("Please enter your problem statement: ")
-    user_query_json = json.dumps({"problem_statement": user_query})
-
-    # Save to JSON file in project directory
-    project_dir = Path(__file__).parent.parent
-    json_file_path = project_dir / "user_input.json"
-
-    with open(json_file_path, 'w', encoding='utf-8') as f:
-        json.dump({"problem_statement": user_query}, f, indent=4)
-
-    print(f"[INFO] User input saved to: {json_file_path}")
-
     root_agent = Agent(
         model=LiteLlm(model="openai/gpt-4o-mini"),
         name="dataset_creator_agent",
         description='An expert agent who finds and downloads datasets based on user requirements',
         instruction=f"""
-        User Query: {user_query}
-
         You are an expert dataset creator. Your task is to fetch high-quality datasets for the user.
 
         If the dataset is present, skip searching and fetching steps.
@@ -187,29 +174,37 @@ async def main():
 
     app_name = 'my_agent_app'
     user_id = 'user1'
+    session_id = 'session1'
 
-    runner = InMemoryRunner(
+    session_service = InMemorySessionService()
+
+    runner = Runner(
+        app_name=app_name,
         agent=root_agent,
-        app_name=app_name,
+        session_service=session_service,
     )
-
-    my_session = await runner.session_service.create_session(
-        app_name=app_name,
-        user_id=user_id
-    )
-
-    content = types.Content(
-            role='user', parts=[types.Part.from_text(text=user_query)]
-        )
-    print('** User says:', content.model_dump(exclude_none=True))
     
-    async for event in runner.run_async(
+    # Collect user input once for this demo and bail if nothing was typed.
+    print("Please describe the type of dataset you need (e.g., 'I need a dataset of customer reviews for sentiment analysis'):")
+    user_input = input("You: ").strip()
+    if not user_input:
+        print("No input provided.")
+        return
+
+    # Wrap the user text in the SDK message container expected by the runner.
+    new_message = types.Content(
+        role="user",
+        parts=[types.Part(text=user_input)],
+    )
+
+    # Stream events emitted by the runner and print the final LLM response.
+    for event in runner.run(
         user_id=user_id,
-        session_id=my_session.id,
-        new_message=content,
+        session_id=session_id,
+        new_message=new_message,
     ):
-        if event.content.parts and event.content.parts[0].text:
-            print(f'** {event.author}: {event.content.parts[0].text}')
+        if event.is_final_response and event.content and event.content.parts:
+            print(f"Agent: {event.content.parts[0].text}")
 
 if __name__ == "__main__":
     asyncio.run(main())
