@@ -1,0 +1,11 @@
+google-adk
+google-genai
+litellm
+kaggle
+kagglehub
+datasets
+huggingface_hub
+python-dotenv
+pathlib
+tavily
+openai
