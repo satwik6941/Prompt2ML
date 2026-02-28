@@ -13,6 +13,8 @@ import os
 import sys
 import json
 from tavily import TavilyClient
+sys.path.append(str(Path(__file__).parent.parent))
+from pipeline_state import load_state, save_state
 
 load_dotenv()
 
@@ -76,23 +78,15 @@ def download_kaggle_dataset(dataset_name: str) -> str:
                 else:
                     shutil.copy2(item, dest)
 
-        # Update JSON file with dataset info
-        home_dir = Path(__file__).parent.parent
-        json_file_path = home_dir / "user_input.json"
-
-        if json_file_path.exists():
-            with open(json_file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        else:
-            data = {}
-
-        data["downloaded_dataset"] = {
-            "source": "kaggle",
-            "dataset_name": dataset_name,
-        }
-
-        with open(json_file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4)
+        # Save dataset info back to shared pipeline state
+        save_state({
+            "downloaded_dataset": {
+                "source": "kaggle",
+                "dataset_name": dataset_name,
+                "path": str(save_dir.absolute())
+            },
+            "status": "dataset_ready"
+        })
 
         success_msg = f"Successfully downloaded Kaggle dataset '{dataset_name}' to {save_dir.absolute()}"
         print(f"[SUCCESS] {success_msg}", flush=True)
@@ -118,23 +112,15 @@ def download_huggingface_dataset(dataset_name: str) -> str:
         # Save dataset to disk
         dataset.save_to_disk(str(dataset_path))
 
-        # Update JSON file with dataset info
-        home_dir = Path(__file__).parent.parent
-        json_file_path = home_dir / "user_input.json"
-
-        if json_file_path.exists():
-            with open(json_file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        else:
-            data = {}
-
-        data["downloaded_dataset"] = {
-            "source": "huggingface",
-            "dataset_name": dataset_name,
-        }
-
-        with open(json_file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4)
+        # Save dataset info back to shared pipeline state
+        save_state({
+            "downloaded_dataset": {
+                "source": "huggingface",
+                "dataset_name": dataset_name,
+                "path": str(dataset_path.absolute())
+            },
+            "status": "dataset_ready"
+        })
 
         success_msg = f"Successfully downloaded HuggingFace dataset '{dataset_name}' to {dataset_path.absolute()}"
         print(f"[SUCCESS] {success_msg}", flush=True)
@@ -144,12 +130,24 @@ def download_huggingface_dataset(dataset_name: str) -> str:
         print(f"[ERROR] {error_msg}", flush=True)
         return error_msg
 
+def read_file(file_path: str) -> str:
+    file_path = Path(__file__).parent.parent / "outputs" / file_path
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        print(f"[INFO] Successfully read file: {file_path}", flush=True)
+        return content
+    except Exception as e:
+        error_msg = f"Error reading file '{file_path}': {str(e)}"
+        print(f"[ERROR] {error_msg}", flush=True)
+        return error_msg
+
 async def main():
     root_agent = Agent(
-        model=LiteLlm(model="openai/gpt-4o-mini"),
+        model=LiteLlm(model="openai/gpt-5-mini-2025-08-07"),
         name="dataset_creator_agent",
         description='An expert agent who finds and downloads datasets based on user requirements',
-        instruction=f"""
+        instruction="""
         You are an expert dataset creator. Your task is to fetch high-quality datasets for the user.
 
         If the dataset is present, skip searching and fetching steps.
@@ -178,33 +176,49 @@ async def main():
 
     session_service = InMemorySessionService()
 
+    # Use async versions of session methods
+    existing_session = await session_service.get_session(
+        app_name=app_name, user_id=user_id, session_id=session_id
+    )
+
+    if existing_session is None:
+        print(f"[INFO] Creating new session and running agent.", flush=True)
+        await session_service.create_session(
+            app_name=app_name, user_id=user_id, session_id=session_id
+        )
+    else:
+        print(f"[INFO] Session already exists. Reusing session.", flush=True)
+
     runner = Runner(
         app_name=app_name,
         agent=root_agent,
         session_service=session_service,
     )
-    
-    # Collect user input once for this demo and bail if nothing was typed.
-    print("Please describe the type of dataset you need (e.g., 'I need a dataset of customer reviews for sentiment analysis'):")
-    user_input = input("You: ").strip()
-    if not user_input:
-        print("No input provided.")
-        return
 
-    # Wrap the user text in the SDK message container expected by the runner.
+    # Load dataset requirements from shared pipeline state
+    state = load_state()
+    user_input = state.get("report") or state.get("user_goal")
+    if not user_input:
+        print("[ERROR] No data found in pipeline_state.json. Run main.py first.")
+        return
+    print(f"[INFO] Loaded requirements from pipeline state (status: {state.get('status')})", flush=True)
+
+    print(f"[INFO] Dataset requirements: {user_input}", flush=True)
+
     new_message = types.Content(
         role="user",
         parts=[types.Part(text=user_input)],
     )
 
-    # Stream events emitted by the runner and print the final LLM response.
-    for event in runner.run(
+    # Use async runner
+    async for event in runner.run_async(
         user_id=user_id,
         session_id=session_id,
         new_message=new_message,
     ):
         if event.is_final_response and event.content and event.content.parts:
             print(f"Agent: {event.content.parts[0].text}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())

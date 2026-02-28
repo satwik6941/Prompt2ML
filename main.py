@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import json
 from dotenv import load_dotenv
+from pipeline_state import save_state
 
 load_dotenv()
 
@@ -16,6 +17,8 @@ conversation_history = [
         'content': [{"type": "input_text", "text": user_query}]
     }
 ]
+
+qa_pairs = []
 
 for i in range(1, 8):
     response = client.responses.create(
@@ -33,6 +36,9 @@ for i in range(1, 8):
     print(f"\nQuestion {i}/7: {question}")
 
     user_answer = input("You: ")
+
+    # Store each Q&A pair
+    qa_pairs.append({"question": question, "answer": user_answer})
 
     conversation_history.append({
         'role': 'assistant',
@@ -76,12 +82,22 @@ def write_text_file(filename: str, content: str):
     with open(filepath, 'w', encoding='utf-8') as f:
         f.write(content)
     print(f"\n✅ Report successfully saved to: {filepath}")
+
+    # Save to shared pipeline state so other agents can consume it
+    save_state({
+        "user_goal": user_query,
+        "qa_pairs": qa_pairs,
+        "report": content,
+        "report_filename": filename,
+        "status": "report_ready"
+    })
+
     return f"File '{filepath}' written successfully."
 
 print("\nGenerating final report, please wait...\n")
 
 final_response = client.responses.create(
-    model="gpt-4o",
+    model="gpt-5.1-2025-11-13",
     instructions="""You are an expert Machine Learning, Deep Learning and Data Science assistant with over 20+ years of experience.
     You have published groundbreaking research, delivered keynotes at NeurIPS, ICML, and CVPR, and mentored hundreds of students and professionals worldwide.
 
@@ -89,51 +105,51 @@ final_response = client.responses.create(
     
     The report MUST follow this exact structure with deep analysis in each section:
 
-    ═══════════════════════════════════════════════════════
+
     📌 SECTION 1: USER'S GOAL & PROBLEM STATEMENT
-    ═══════════════════════════════════════════════════════
+
     - Restate the user's goal clearly and precisely
     - Break down the core problem they are trying to solve
     - Identify the expected outcome and success criteria
 
-    ═══════════════════════════════════════════════════════
+
     🔬 SECTION 2: STATE OF THE ART ANALYSIS
-    ═══════════════════════════════════════════════════════
+
     - Current leading approaches and techniques in this domain
     - Recent breakthroughs and research papers worth knowing
     - Benchmark datasets commonly used in this field
     - Current performance benchmarks and SOTA metrics
     - Key research labs and companies working in this area
 
-    ═══════════════════════════════════════════════════════
+
     📊 SECTION 3: ANALYSIS OF USER'S REQUIREMENTS & CONSTRAINTS
-    ═══════════════════════════════════════════════════════
+
     - Detailed breakdown of all requirements mentioned
     - Analysis of constraints (time, budget, compute, data, skills)
     - Feasibility assessment given the constraints
     - Risk level: Low / Medium / High with justification
 
-    ═══════════════════════════════════════════════════════
+
     🗂️ SECTION 4: DATASET & DATA STRATEGY
-    ═══════════════════════════════════════════════════════
+
     - Recommended publicly available datasets with links
     - Data collection strategies if datasets are unavailable
     - Data preprocessing and augmentation techniques
     - Data splitting strategy (train/val/test)
     - Potential data quality issues and how to handle them
 
-    ═══════════════════════════════════════════════════════
+
     🛠️ SECTION 5: RECOMMENDED TOOLS, FRAMEWORKS & TECHNIQUES
-    ═══════════════════════════════════════════════════════
+
     - Programming languages and libraries (with versions)
     - Deep learning frameworks and why they are recommended
     - Pre-trained models and transfer learning options
     - Experiment tracking tools (MLflow, W&B, etc.)
     - Hardware recommendations
 
-    ═══════════════════════════════════════════════════════
+
     🗺️ SECTION 6: STEP-BY-STEP ACTION PLAN
-    ═══════════════════════════════════════════════════════
+
     Provide a detailed week-by-week or phase-by-phase plan:
     - Phase 1: Setup & Research (with specific tasks)
     - Phase 2: Data Collection & Preprocessing (with specific tasks)
@@ -142,34 +158,34 @@ final_response = client.responses.create(
     - Phase 5: Deployment / Presentation (with specific tasks)
     Include estimated time for each phase.
 
-    ═══════════════════════════════════════════════════════
+
     ⚠️ SECTION 7: CHALLENGES, RISKS & MITIGATION STRATEGIES
-    ═══════════════════════════════════════════════════════
+
     - List every possible challenge with detailed explanation
     - Technical risks and how to mitigate each one
     - Non-technical risks (time, scope creep, etc.)
     - Fallback strategies if primary approach fails
 
-    ═══════════════════════════════════════════════════════
+
     📚 SECTION 8: LEARNING RESOURCES & REFERENCES
-    ═══════════════════════════════════════════════════════
+
     - Research papers to read (with authors and year)
     - Online courses and tutorials
     - GitHub repositories worth exploring
     - Books and documentation
     - Communities and forums to join
 
-    ═══════════════════════════════════════════════════════
+
     💡 SECTION 9: EXPERT TIPS & ADDITIONAL INSIGHTS
-    ═══════════════════════════════════════════════════════
+
     - Pro tips specific to user's use case
     - Common mistakes to avoid
     - How to stand out / make the project impressive
     - Future extensions and improvements after initial goal
 
-    ═══════════════════════════════════════════════════════
+
     ✅ SECTION 10: FINAL VERDICT & ENCOURAGEMENT
-    ═══════════════════════════════════════════════════════
+
     - Overall feasibility score (1-10) with justification
     - Summary of the most critical next steps
     - Motivational closing remarks
@@ -222,3 +238,12 @@ if not report_printed:
     print("COMPREHENSIVE SUMMARY REPORT")
     print("="*60)
     print(final_response.output_text)
+
+    # Save even if report came as plain text (no tool call)
+    save_state({
+        "user_goal": user_query,
+        "qa_pairs": qa_pairs,
+        "report": final_response.output_text,
+        "report_filename": None,
+        "status": "report_ready"
+    })
