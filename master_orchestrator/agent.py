@@ -1,22 +1,3 @@
-"""
-Master Orchestrator — Single Entry Point for the Prompt2ML Pipeline
-
-Architecture:
-    SequentialAgent (master_orchestrator)
-    ├── Phase 1: Requirement Gatherer Agent
-    │   └── Asks 7 questions, generates comprehensive report, saves to pipeline_state
-    ├── Phase 2: Dataset Extractor Agent
-    │   └── Searches Kaggle/HuggingFace, downloads relevant datasets
-    └── Phase 3: Data Preprocessing Orchestrator
-        ├── Agent 1: Dataset Analyzer
-        ├── Agent 2: Preprocessing Strategist
-        ├── LoopAgent (Agent 3 + Agent 4)
-        └── Agent 5: Report Generator
-
-Run:
-    python master_orchestrator/agent.py
-"""
-
 import os
 import sys
 import json
