@@ -1,3 +1,13 @@
+"""
+Master Orchestrator — Single Entry Point for the Prompt2ML Pipeline
+
+Phase 1: Requirement Gatherer Agent (interactive — asks 7 questions)
+Phase 2: Dataset Extractor Agent (autonomous — searches & downloads datasets)
+
+Run:
+    python master_orchestrator/agent.py
+"""
+
 import os
 import sys
 import json
@@ -17,8 +27,18 @@ load_dotenv(PROJECT_ROOT / "data_preprocessing_agent" / ".env")
 
 from pipeline_state import load_state, save_state
 
-MODEL = "gemini-3.1-flash-lite-preview"
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+MODEL = "gemini-2.5-flash"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+
+
+# ============================================================
+# ========  PHASE 1: REQUIREMENT GATHERER TOOLS  =============
+# ============================================================
 
 def get_current_pipeline_status() -> str:
     """
@@ -87,9 +107,9 @@ def save_requirement_report(
 # ============================================================
 
 from google.adk.agents import Agent
-from google.adk.tools import google_search
+
+# Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
-from data_preprocessing_agent.agent import root_agent as preprocessing_orchestrator
 
 
 # --- Phase 1: Requirement Gatherer ---
@@ -120,7 +140,7 @@ WORKFLOW:
 
    Be concise — one question per response. Tailor each question based on prior answers.
 
-4. After all 7 answers, generate a COMPREHENSIVE report with these 10 sections and use google search to find information and then synthesize it into actionable insights:
+4. After all 7 answers, generate a COMPREHENSIVE report with these 10 sections:
 
    SECTION 1: USER'S GOAL & PROBLEM STATEMENT
    SECTION 2: STATE OF THE ART ANALYSIS
@@ -133,8 +153,9 @@ WORKFLOW:
    SECTION 9: EXPERT TIPS & ADDITIONAL INSIGHTS
    SECTION 10: FINAL VERDICT & ENCOURAGEMENT
 
-   After all these, give a final conclusion that guides the person for the project and gives him a perspective on how to approach the project, what to focus on, and how to get started. Make it inspiring and motivating.
-   Use the user's specific answers to tailor every section. Do not give generic advice.
+   After all these, give a final conclusion that guides the person for the project and gives him
+   a perspective on how to approach the project, what to focus on, and how to get started.
+   Make it inspiring and motivating.
 
    The report must be DETAILED, SPECIFIC to the user's answers, and at minimum 1500 words.
 
@@ -153,101 +174,184 @@ RULES:
 - Tailor every section to the user's specific answers — no generic advice
 - The report must be comprehensive and actionable
 """,
-    tools=[get_current_pipeline_status, save_requirement_report, google_search],
+    tools=[get_current_pipeline_status, save_requirement_report],
 )
 
+# root_agent for ADK compatibility (adk web / adk run from this folder)
 root_agent = requirement_gatherer_agent
+
+
+# ============================================================
+# ==================  STANDALONE RUNNER  =====================
+# ============================================================
+
+async def run_agent_turn(runner, user_id, session_id, user_text):
+    """
+    Send a message to the agent and collect its full text response.
+    Retries up to 3 times on Gemini 500 errors.
+    Returns the concatenated agent response text.
+    """
+    message = types.Content(
+        role="user",
+        parts=[types.Part(text=user_text)],
+    )
+
+    agent_response = ""
+
+    for attempt in range(3):
+        try:
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=session_id,
+                new_message=message,
+            ):
+                if event.content and event.content.parts:
+                    for part in event.content.parts:
+                        text = getattr(part, "text", None)
+                        if text:
+                            author = event.author or "Agent"
+                            print(f"\n[{author}]: {text}", flush=True)
+                            agent_response += text
+            return agent_response
+        except Exception as e:
+            error_msg = str(e)
+            if "500" in error_msg or "INTERNAL" in error_msg:
+                print(f"\n[WARN] Gemini server error (attempt {attempt + 1}/3). Retrying in 5s...", flush=True)
+                await asyncio.sleep(5)
+                if attempt == 2:
+                    print("\n[ERROR] Gemini API failed after 3 attempts.", flush=True)
+                    return None
+            else:
+                print(f"\n[ERROR] {error_msg}", flush=True)
+                return None
+
+    return agent_response
+
 
 async def run_pipeline():
     """
-    Run the requirement gatherer agent with InMemorySessionService.
-    Handles the 7-question conversational loop with the user.
-    Usage: python master_orchestrator/agent.py
+    Run the full pipeline:
+      Phase 1: Requirement Gatherer (interactive Q&A with user)
+      Phase 2: Dataset Extractor (autonomous — reads report, downloads datasets)
     """
     APP_NAME = "prompt2ml"
     USER_ID = "user1"
-    SESSION_ID = "session_master"
 
-    # --- Session Setup ---
     session_service = InMemorySessionService()
+
+    # ==============================================================
+    # PHASE 1: Requirement Gatherer (interactive)
+    # ==============================================================
+
+    SESSION_PHASE1 = "session_phase1"
     await session_service.create_session(
-        app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
+        app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE1
     )
 
-    runner = Runner(
+    phase1_runner = Runner(
         app_name=APP_NAME,
-        agent=root_agent,
+        agent=requirement_gatherer_agent,
         session_service=session_service,
     )
 
     print("\n" + "=" * 60)
-    print("  PROMPT2ML — Requirement Gatherer")
+    print("  PROMPT2ML — Phase 1: Requirement Gathering")
     print("=" * 60)
 
-    user_input = input("\nPlease tell me what you want to build: ")
+    # Check if Phase 1 already done
+    state = load_state()
+    if state.get("status") == "report_ready" and state.get("user_goal"):
+        print(f"\n[PIPELINE] Report already exists for: {state['user_goal'][:80]}...")
+        print("[PIPELINE] Skipping Phase 1, moving to Phase 2.\n")
+    else:
+        # Get the user's project goal
+        user_input = input("\nPlease tell me what you want to build: ")
 
-    # --- Conversational loop: send message → print response → get next input ---
-    for _ in range(20):  # Safety cap at 20 turns (7 questions + overhead)
-        message = types.Content(
-            role="user",
-            parts=[types.Part(text=user_input)],
+        # Conversational loop: 7 questions + report generation
+        for _ in range(20):  # Safety cap
+            response = await run_agent_turn(
+                phase1_runner, USER_ID, SESSION_PHASE1, user_input
+            )
+
+            if response is None:
+                print("\n[ERROR] Agent failed to respond. Exiting.")
+                return
+
+            # Check if report was saved
+            if load_state().get("status") == "report_ready":
+                print("\n[PIPELINE] Phase 1 complete — report saved!")
+                break
+
+            # Agent asked a question → get user's answer
+            if "?" in response:
+                user_input = input("\nYou: ")
+            else:
+                user_input = "Please continue with the next question."
+
+    # ==============================================================
+    # PHASE 2: Dataset Extractor (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 2: Dataset Extraction")
+    print("=" * 60)
+
+    # Check if datasets already downloaded
+    state = load_state()
+    if state.get("status") == "dataset_ready" and state.get("downloaded_dataset"):
+        print(f"\n[PIPELINE] Datasets already downloaded. Skipping Phase 2.")
+    else:
+        SESSION_PHASE2 = "session_phase2"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE2
         )
 
-        agent_response_text = ""
+        phase2_runner = Runner(
+            app_name=APP_NAME,
+            agent=dataset_extractor_agent,
+            session_service=session_service,
+        )
 
-        # Retry up to 3 times on Gemini server errors (500)
-        for attempt in range(3):
-            try:
-                async for event in runner.run_async(
-                    user_id=USER_ID,
-                    session_id=SESSION_ID,
-                    new_message=message,
-                ):
-                    if event.content and event.content.parts:
-                        for part in event.content.parts:
-                            text = getattr(part, "text", None)
-                            if text:
-                                author = event.author or "Agent"
-                                print(f"\n[{author}]: {text}", flush=True)
-                                agent_response_text += text
-                break  # Success — exit retry loop
-            except Exception as e:
-                error_msg = str(e)
-                if "500" in error_msg or "INTERNAL" in error_msg:
-                    print(f"\n[WARN] Gemini server error (attempt {attempt + 1}/3). Retrying in 5s...", flush=True)
-                    await asyncio.sleep(5)
-                    if attempt == 2:
-                        print("\n[ERROR] Gemini API failed after 3 attempts. Try running again.", flush=True)
-                        return
-                else:
-                    print(f"\n[ERROR] {error_msg}", flush=True)
-                    return
+        # Feed the report to the extractor agent — it reads from pipeline_state
+        # but needs a user message to kick off
+        state = load_state()
+        kickoff_message = (
+            f"Find and download relevant datasets for this ML project.\n"
+            f"User goal: {state.get('user_goal', '')}\n"
+            f"Report summary: {state.get('report', '')[:2000]}"
+        )
 
-        # Check if the agent is done (report saved → status changed)
-        current_status = load_state().get("status", "")
-        if current_status == "report_ready":
-            print("\n[PIPELINE] Report generated and saved!", flush=True)
-            break
+        print("\n[PIPELINE] Searching and downloading datasets...\n", flush=True)
 
-        # If the agent responded with a question, get user's answer
-        if "?" in agent_response_text:
-            user_input = input("\nYou: ")
-        else:
-            # Agent didn't ask a question and status isn't report_ready
-            # Nudge it to continue
-            user_input = "Please continue with the next question."
+        response = await run_agent_turn(
+            phase2_runner, USER_ID, SESSION_PHASE2, kickoff_message
+        )
 
-    # --- Done ---
+        if response is None:
+            print("\n[ERROR] Dataset extractor failed. Exiting.")
+            return
+
+        print("\n[PIPELINE] Phase 2 complete — datasets downloaded!")
+
+    # ==============================================================
+    # DONE
+    # ==============================================================
+
     final_state = load_state()
     print("\n" + "=" * 60)
-    print("  REQUIREMENT GATHERING COMPLETE")
+    print("  PIPELINE STATUS")
     print("=" * 60)
     print(f"  Status: {final_state.get('status', 'unknown')}")
     print(f"  User Goal: {final_state.get('user_goal', 'N/A')[:100]}")
     print(f"  Q&A Pairs: {len(final_state.get('qa_pairs', []))}")
     if final_state.get("report"):
         print(f"  Report: {len(final_state['report'])} characters")
+    if final_state.get("downloaded_dataset"):
+        ds = final_state["downloaded_dataset"]
+        print(f"  Dataset: {ds.get('dataset_name', 'N/A')} ({ds.get('source', 'N/A')})")
+        print(f"  Path: {ds.get('path', 'N/A')}")
     print("=" * 60)
+    print("\n  Next: Run data_preprocessing_agent to preprocess the downloaded dataset.")
 
 
 if __name__ == "__main__":

@@ -183,9 +183,9 @@ def get_dataset_requirements() -> str:
 
 from google.adk.agents import Agent
 
-# Import MCP toolsets — Tavily (web search + extract) and HuggingFace Hub
-sys.path.append(str(Path(__file__).parent.parent))
-from mcp_servers.mcp_servers import tavily_mcp, hugging_face_mcp
+# MCP toolsets — commented out for now, uncomment when MCP servers are ready
+# sys.path.append(str(Path(__file__).parent.parent))
+# from mcp_servers.mcp_servers import tavily_mcp, hugging_face_mcp
 
 dataset_extractor_agent = Agent(
     model="gemini-3.1-flash-lite-preview",
@@ -193,17 +193,9 @@ dataset_extractor_agent = Agent(
     description="Searches Kaggle and HuggingFace for relevant datasets and downloads them.",
     instruction="""You are the Dataset Extractor Agent. Your task is to find and download the best datasets for the user's ML project.
 
-You have TWO ways to search for datasets:
-A) Custom tools: search_datasets (Tavily-powered, searches Kaggle/HuggingFace)
-B) MCP tools: tavily-search (real-time web search), tavily-extract (extract data from URLs),
-   and HuggingFace Hub tools (search HF datasets directly)
-
 WORKFLOW:
 1. Call get_dataset_requirements to understand what the user needs.
-2. Use search_datasets OR tavily-search to find relevant datasets on Kaggle or HuggingFace.
-   - Use tavily-search for broader web searches across multiple dataset platforms.
-   - Use tavily-extract to get details from a specific dataset page URL.
-   - Use HuggingFace MCP tools to search HF Hub directly if needed.
+2. Use search_datasets to find relevant datasets on Kaggle or HuggingFace.
 3. Analyze the search results — pick the MOST relevant datasets (prefer Kaggle for tabular data).
 4. Download 1-3 of the best datasets using download_kaggle_dataset or download_huggingface_dataset.
 5. Respond with a summary of what was downloaded and where.
@@ -215,7 +207,7 @@ IMPORTANT:
   * From 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name'
   * For HuggingFace: From 'huggingface.co/datasets/username/dataset-name' extract 'username/dataset-name'
 - Skip any results that are code notebooks or kernels (URLs with '/code/' or '/kernels/')
-- If no good datasets are found, try different search queries using both custom tools and MCP tools
+- If no good datasets are found, try different search queries
 - Download at least 1 dataset, preferably 2-3 for Agent 1 to choose from
 """,
     tools=[
@@ -223,8 +215,8 @@ IMPORTANT:
         search_datasets,
         download_kaggle_dataset,
         download_huggingface_dataset,
-        tavily_mcp,
-        hugging_face_mcp,
+        # tavily_mcp,
+        # hugging_face_mcp,
     ],
 )
 
