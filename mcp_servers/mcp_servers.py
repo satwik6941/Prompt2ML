@@ -18,7 +18,7 @@ hugging_face_mcp = McpToolset(
                 "HF_TOKEN": HUGGING_FACE_TOKEN,
             }
         ),
-        timeout=30,
+        timeout=120,
     ),
 )
 
@@ -34,6 +34,6 @@ tavily_mcp = McpToolset(
                 "TAVILY_API_KEY": TAVILY_API_KEY,
             }
         ),
-        timeout=30,
+        timeout=120,
     ),
 )
