@@ -110,7 +110,7 @@ from google.adk.agents import Agent
 
 # Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
-
+from data_preprocessing_agent.agent import data_preprocessing_agent
 
 # --- Phase 1: Requirement Gatherer ---
 requirement_gatherer_agent = Agent(
@@ -318,7 +318,7 @@ async def run_pipeline():
         kickoff_message = (
             f"Find and download relevant datasets for this ML project.\n"
             f"User goal: {state.get('user_goal', '')}\n"
-            f"Report summary: {state.get('report', '')[:2000]}"
+            f"Report summary: {state.get('report', '')}"
         )
 
         print("\n[PIPELINE] Searching and downloading datasets...\n", flush=True)
@@ -352,6 +352,48 @@ async def run_pipeline():
         print(f"  Path: {ds.get('path', 'N/A')}")
     print("=" * 60)
     print("\n  Next: Run data_preprocessing_agent to preprocess the downloaded dataset.")
+
+    # ==============================================================
+    # PHASE 3: Dataset Preprocessing (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 3: Dataset Preprocessing")
+    print("=" * 60)
+
+    state = load_state()
+    if state.get("status") == "pipeline_complete" and state.get("report_path"):
+        print(f"\n[PIPELINE] Datasets already preprocessed. Skipping Phase 3.")
+    else:
+        SESSION_PHASE3 = "session_phase3"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE3
+        )
+
+        phase3_runner = Runner(
+            app_name=APP_NAME,
+            agent=data_preprocessing_agent,
+            session_service=session_service,
+        )
+
+        # Feed the report to the preprocessing agent — it reads from pipeline_state
+        # but needs a user message to kick off
+        state = load_state()
+        kickoff_message = (
+            "Please do the data preprocessing steps for this ML project "
+            "based on the user's goal, requirements, and downloaded datasets."
+        )
+        print("\n[PIPELINE] Preprocessing datasets...\n", flush=True)
+
+        response = await run_agent_turn(
+            phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message
+        )
+
+        if response is None:
+            print("\n[ERROR] Data preprocessing failed. Exiting.")
+            return
+
+        print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
 
 
 if __name__ == "__main__":
