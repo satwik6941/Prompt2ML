@@ -427,6 +427,49 @@ def save_preprocessing_plan(
 # ==================  AGENT 3 TOOLS  =========================
 # ============================================================
 
+def _resolve_local_path(p: str) -> str:
+    """
+    Defensive path translator for built-in (host-side) preprocessing tools.
+
+    The LLM sometimes hands a sandbox path like '/workspace/output/foo.csv'
+    to a built-in tool that runs on the host. Pandas would then crash with
+    [Errno 2] No such file or directory. This helper rewrites such paths to
+    the equivalent local file under modified_datasets/ if it exists, and
+    raises a CLEAR error otherwise so the LLM can recover instead of looping.
+    """
+    if not p:
+        raise FileNotFoundError(
+            "Empty dataset_path. Built-in tools need an absolute LOCAL path."
+        )
+
+    # Sandbox path? Try to remap to local modified_datasets/<basename>
+    if p.startswith("/workspace/") or p.startswith("\\workspace\\"):
+        basename = os.path.basename(p.replace("\\", "/"))
+        candidate = MODIFIED_DATASETS_DIR / basename
+        if candidate.exists():
+            return str(candidate)
+        raise FileNotFoundError(
+            f"Path '{p}' is a SANDBOX path. Built-in tools run on the HOST and "
+            f"cannot read sandbox files. Either (1) call download_from_sandbox "
+            f"first to copy the file to '{MODIFIED_DATASETS_DIR / basename}', or "
+            f"(2) skip the sandbox entirely and use the local path returned by "
+            f"the previous built-in tool. Built-in tools never accept /workspace/... paths."
+        )
+
+    if not os.path.isabs(p):
+        # Resolve relative to project root
+        candidate = PROJECT_ROOT / p
+        if candidate.exists():
+            return str(candidate)
+
+    if not os.path.exists(p):
+        raise FileNotFoundError(
+            f"Local file not found: {p}. Use the path returned by the previous "
+            f"built-in tool, or the 'dataset_path' from get_preprocessing_context."
+        )
+    return p
+
+
 def get_preprocessing_context() -> str:
     """
     Load everything Agent 3 needs: user goal, Agent 1's dataset selection,
@@ -466,6 +509,7 @@ def handle_missing_values(
     """
     import pandas as pd
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     before_missing = df.isnull().sum().to_dict()
     before_rows = len(df)
@@ -530,6 +574,7 @@ def remove_duplicates(
     """
     import pandas as pd
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     subset = None if subset_columns == "all" else [c.strip() for c in subset_columns.split(",")]
 
@@ -571,6 +616,7 @@ def drop_columns(
     """
     import pandas as pd
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     cols = [c.strip() for c in columns_to_drop.split(",") if c.strip()]
     existing = [c for c in cols if c in df.columns]
@@ -609,6 +655,7 @@ def encode_categorical_columns(
     import pandas as pd
     from sklearn.preprocessing import LabelEncoder
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     encodings = json.loads(encoding_json)
     details = {}
@@ -693,6 +740,7 @@ def scale_numeric_columns(
     import numpy as np
     from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler, PowerTransformer
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     scalings = json.loads(scaling_json)
     exclude = {c.strip() for c in exclude_columns.split(",") if c.strip()}
@@ -770,6 +818,7 @@ def handle_outliers(
     import pandas as pd
     import numpy as np
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     strategies = json.loads(outlier_json)
     details = {}
@@ -857,6 +906,7 @@ def parse_datetime_columns(
     """
     import pandas as pd
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     configs = json.loads(datetime_json)
     details = {}
@@ -960,6 +1010,7 @@ def engineer_features(
     import pandas as pd
     import numpy as np
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     features = json.loads(features_json)
     details = {}
@@ -1071,6 +1122,7 @@ def process_text_columns(
     import numpy as np
     import re
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     configs = json.loads(text_json)
     details = {}
@@ -1165,6 +1217,7 @@ def detect_and_fix_data_types(
     """
     import pandas as pd
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     fixes = json.loads(type_fixes_json)
     details = {}
@@ -1239,6 +1292,7 @@ def validate_dataset(
     import pandas as pd
     import numpy as np
 
+    dataset_path = _resolve_local_path(dataset_path)
     df = pd.read_csv(dataset_path)
     checks = json.loads(checks_json)
     results = {}
@@ -1345,6 +1399,7 @@ def save_preprocessed_output(
     MODIFIED_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
     dest = MODIFIED_DATASETS_DIR / output_filename
 
+    dataset_path = _resolve_local_path(dataset_path)
     shutil.copy2(dataset_path, dest)
 
     save_state({
@@ -1405,6 +1460,8 @@ def compare_before_after(
     import numpy as np
 
     try:
+        original_path = _resolve_local_path(original_path)
+        preprocessed_path = _resolve_local_path(preprocessed_path)
         orig = pd.read_csv(original_path)
         proc = pd.read_csv(preprocessed_path)
     except Exception as e:
@@ -1707,62 +1764,89 @@ preprocessing_executor_agent = Agent(
 
 Your job is to execute the preprocessing plan step by step.
 
-WORKFLOW:
-1. Call get_preprocessing_context to load the plan, dataset path, AND any validation feedback from Agent 4 (for retries).
-2. Call start_sandbox to start the secure execution environment.
-3. Call upload_dataset_to_sandbox to upload the selected dataset into the sandbox.
-4. Follow the step_by_step_order from the plan EXACTLY.
-5. For each step, use the appropriate tool.
-6. Each tool outputs a file — use that output file as input for the next tool.
-7. After all steps, call download_from_sandbox to save the final preprocessed file locally.
-8. Call save_preprocessed_output with the local file path.
-9. Call stop_sandbox to clean up.
+================================================================
+CRITICAL — TWO KINDS OF TOOLS, TWO KINDS OF PATHS
+================================================================
+You have TWO categories of tools and they DO NOT share filesystems:
 
-TOOL SELECTION GUIDE (use these for standard preprocessing steps):
-- drop_columns → use drop_columns tool
-- handle_duplicates → use remove_duplicates tool
-- fix_data_types → use detect_and_fix_data_types tool
-- handle_missing → use handle_missing_values tool
-- parse_dates → use parse_datetime_columns tool
-- process_text → use process_text_columns tool
-- handle_outliers → use handle_outliers tool
-- encode_categoricals → use encode_categorical_columns tool
-- feature_engineering → use engineer_features tool
-- scale_numerics → use scale_numeric_columns tool
-- final_validation → use validate_dataset tool
+A) BUILT-IN TOOLS (run on the HOST machine, use LOCAL Windows paths)
+   - handle_missing_values, remove_duplicates, drop_columns,
+     encode_categorical_columns, scale_numeric_columns,
+     handle_outliers, parse_datetime_columns, engineer_features,
+     process_text_columns, detect_and_fix_data_types,
+     validate_dataset, save_preprocessed_output
+   - These read/write files in: """ + str(MODIFIED_DATASETS_DIR) + """
+   - NEVER pass a /workspace/... path to these tools — it will crash
+     with [Errno 2] No such file or directory.
 
-SANDBOX TOOLS (use these for complex/custom transformations):
-- write_file_to_sandbox → write a Python script into the sandbox
-- run_in_sandbox → execute the script (e.g. 'python3 /workspace/data/script.py')
-- read_file_from_sandbox → read results or processed files from sandbox
-- download_from_sandbox → save sandbox files back to your local machine
+B) SANDBOX TOOLS (run inside the Docker container, use /workspace/... paths)
+   - start_sandbox, stop_sandbox, upload_dataset_to_sandbox,
+     run_in_sandbox, write_file_to_sandbox, read_file_from_sandbox,
+     download_from_sandbox
+   - Files inside the sandbox live in /workspace/data/ and /workspace/output/
+   - The host filesystem is NOT visible inside the sandbox.
 
-For complex steps that the built-in tools can't handle:
-1. Write a Python script using write_file_to_sandbox
-2. Run it using run_in_sandbox
-3. Read/download the results
+================================================================
+DEFAULT WORKFLOW (use built-in tools — no sandbox needed)
+================================================================
+1. Call get_preprocessing_context to load the plan, dataset path,
+   AND any validation feedback from Agent 4 (for retries).
+2. The 'selected_dataset_path' from context is a LOCAL Windows path.
+   Use it as the input to the FIRST built-in tool.
+3. For each step in step_by_step_order, call the matching built-in tool.
+   - Each built-in tool returns the LOCAL path of its output file.
+   - Use that returned path as the input to the next tool.
+   - Intermediate files go in modified_datasets/ as step_N_<name>.csv
+4. After the last step, call save_preprocessed_output with the
+   final LOCAL path. This finalizes Agent 3's work.
 
-SANDBOX FILE PATHS:
-- Data files go in: /workspace/data/
-- Output files go in: /workspace/output/
+DO NOT call start_sandbox / upload_dataset_to_sandbox unless step (B)
+below applies.
 
-LOCAL FILE PATH CONVENTION:
-- Use the modified_datasets folder for intermediate files
-- Name intermediate files: step_N_<step_name>.csv
-- Final file: preprocessed_<original_filename>.csv
-- The modified_datasets folder is at: """ + str(MODIFIED_DATASETS_DIR) + """
+================================================================
+WHEN TO USE THE SANDBOX (only for complex custom transforms)
+================================================================
+Only spin up the sandbox if a step in the plan CANNOT be done by
+any built-in tool — for example: a custom domain-specific transform,
+running a library not exposed as a built-in tool, etc.
+
+In that case, do this MINI-LOOP for that one step ONLY:
+  1. start_sandbox
+  2. upload_dataset_to_sandbox(local_path)  → returns /workspace/data/<name>.csv
+  3. write_file_to_sandbox('/workspace/data/script.py', '<python code>')
+  4. run_in_sandbox('python3 /workspace/data/script.py')
+  5. download_from_sandbox('/workspace/output/<result>.csv',
+                           '<local path in modified_datasets/>')
+  6. stop_sandbox
+Then resume the built-in tool chain on the LOCAL downloaded file.
+
+================================================================
+TOOL SELECTION GUIDE FOR PLAN STEPS
+================================================================
+- drop_columns → drop_columns tool
+- handle_duplicates → remove_duplicates tool
+- fix_data_types → detect_and_fix_data_types tool
+- handle_missing → handle_missing_values tool
+- parse_dates → parse_datetime_columns tool
+- process_text → process_text_columns tool
+- handle_outliers → handle_outliers tool
+- encode_categoricals → encode_categorical_columns tool
+- feature_engineering → engineer_features tool
+- scale_numerics → scale_numeric_columns tool
+- final_validation → validate_dataset tool
 
 RETRY HANDLING:
-- If agent4_feedback is not empty, focus ONLY on fixing the issues mentioned
-- Re-run only the affected steps, not the entire pipeline
-- Use the previously preprocessed file as starting point for fixes
+- If agent4_feedback is not empty, focus ONLY on fixing those issues.
+- Re-run only the affected steps, starting from the previously
+  preprocessed local file (not from the original).
 
 RULES:
-- ALWAYS start the sandbox before any processing and stop it when done
-- ALWAYS chain tools: output of step N = input of step N+1
-- Check each tool's return status before proceeding
-- If a built-in tool fails, write a custom Python script and run it in the sandbox
-- Keep track of row count changes — never lose more than 20% of rows without good reason
+- NEVER mix path types. Built-in tools = local paths only.
+  Sandbox tools = /workspace/... paths only.
+- ALWAYS chain tools: output of step N = input of step N+1.
+- Check each tool's return status before proceeding.
+- Keep track of row counts — never lose more than 20% without good reason.
+- If you started the sandbox, you MUST stop it before finishing.
 """,
     tools=[
         get_preprocessing_context,
@@ -2048,8 +2132,7 @@ RULES:
 # ============================================================
 # ==================  ROOT ORCHESTRATOR  =====================
 # ============================================================
-
-root_agent = SequentialAgent(
+data_preprocessing_agent = SequentialAgent(
     name="data_preprocessing_orchestrator",
     description="Orchestrates the full data preprocessing pipeline: dataset selection → planning → execution+validation loop → final report.",
     sub_agents=[
@@ -2059,3 +2142,5 @@ root_agent = SequentialAgent(
         report_generator_agent,
     ],
 )
+
+root_agent = data_preprocessing_agent
