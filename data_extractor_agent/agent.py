@@ -1,18 +1,18 @@
-import asyncio
-from google.adk.agents import Agent
-from google.genai import types
-from google.adk.models.lite_llm import LiteLlm
-from google.adk.sessions import InMemorySessionService
-from google.adk.runners import Runner
-from datasets import load_dataset
-from dotenv import load_dotenv
-import kagglehub
-from pathlib import Path
-import shutil
+"""
+Dataset Extractor Agent (Google ADK)
+
+Searches Kaggle and HuggingFace for relevant datasets,
+downloads them, and saves to the datasets/ folder.
+Reads user requirements from pipeline_state.json.
+"""
+
 import os
 import sys
 import json
-from tavily import TavilyClient
+import shutil
+from pathlib import Path
+from dotenv import load_dotenv
+
 sys.path.append(str(Path(__file__).parent.parent))
 from pipeline_state import load_state, save_state
 
@@ -20,13 +20,29 @@ load_dotenv()
 
 sys.stdout.reconfigure(line_buffering=True)
 
+from tavily import TavilyClient
+
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+
+# ============================================================
+# TOOLS
+# ============================================================
+
 def search_datasets(query: str) -> str:
+    """
+    Search for datasets on Kaggle and HuggingFace using Tavily.
+
+    Args:
+        query: A search query describing the type of dataset needed
+            (e.g. 'YouTube trending videos dataset with views likes comments').
+
+    Returns:
+        Formatted string with dataset titles, URLs, and descriptions.
+    """
     try:
         print(f"[INFO] Searching for datasets with query: '{query}'...", flush=True)
 
-        # Search for datasets using Tavily
         response = tavily_client.search(
             query=query,
             search_depth="advanced",
@@ -34,7 +50,6 @@ def search_datasets(query: str) -> str:
             include_domains=["kaggle.com", "huggingface.co"]
         )
 
-        # Format the results
         results = []
         for result in response.get('results', []):
             title = result.get('title', 'No title')
@@ -56,21 +71,29 @@ def search_datasets(query: str) -> str:
 
 
 def download_kaggle_dataset(dataset_name: str) -> str:
+    """
+    Download a dataset from Kaggle using kagglehub.
+
+    Args:
+        dataset_name: The Kaggle dataset identifier in format 'username/dataset-name'
+            (e.g. 'datasnaek/youtube-new').
+
+    Returns:
+        Success message with download path, or error message.
+    """
+    import kagglehub
+
     try:
         print(f"[INFO] Downloading Kaggle dataset '{dataset_name}'...", flush=True)
 
-        # Download dataset - kagglehub downloads to cache and returns the path
         download_path = kagglehub.dataset_download(dataset_name)
 
-        # Create datasets directory with dataset-specific folder
         base_dir = Path(__file__).parent.parent / "datasets"
         save_dir = base_dir / dataset_name.replace("/", "_")
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        # Copy from cache to datasets folder
         source_path = Path(download_path)
         if source_path.exists():
-            # Copy all files from download path to save_dir
             for item in source_path.iterdir():
                 dest = save_dir / item.name
                 if item.is_dir():
@@ -78,7 +101,6 @@ def download_kaggle_dataset(dataset_name: str) -> str:
                 else:
                     shutil.copy2(item, dest)
 
-        # Save dataset info back to shared pipeline state
         save_state({
             "downloaded_dataset": {
                 "source": "kaggle",
@@ -98,21 +120,28 @@ def download_kaggle_dataset(dataset_name: str) -> str:
 
 
 def download_huggingface_dataset(dataset_name: str) -> str:
+    """
+    Download a dataset from HuggingFace.
+
+    Args:
+        dataset_name: The HuggingFace dataset identifier in format 'username/dataset-name'
+            (e.g. 'stanfordnlp/imdb').
+
+    Returns:
+        Success message with download path, or error message.
+    """
+    from datasets import load_dataset as hf_load_dataset
+
     try:
-        # Create datasets directory with dataset-specific folder
         base_dir = Path(__file__).parent.parent / "datasets"
         dataset_path = base_dir / dataset_name.replace("/", "_")
         dataset_path.mkdir(parents=True, exist_ok=True)
 
         print(f"[INFO] Downloading HuggingFace dataset '{dataset_name}'...", flush=True)
 
-        # Download dataset
-        dataset = load_dataset(dataset_name)
-
-        # Save dataset to disk
+        dataset = hf_load_dataset(dataset_name)
         dataset.save_to_disk(str(dataset_path))
 
-        # Save dataset info back to shared pipeline state
         save_state({
             "downloaded_dataset": {
                 "source": "huggingface",
@@ -130,95 +159,66 @@ def download_huggingface_dataset(dataset_name: str) -> str:
         print(f"[ERROR] {error_msg}", flush=True)
         return error_msg
 
-def read_file(file_path: str) -> str:
-    file_path = Path(__file__).parent.parent / "outputs" / file_path
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        print(f"[INFO] Successfully read file: {file_path}", flush=True)
-        return content
-    except Exception as e:
-        error_msg = f"Error reading file '{file_path}': {str(e)}"
-        print(f"[ERROR] {error_msg}", flush=True)
-        return error_msg
 
-async def main():
-    root_agent = Agent(
-        model=LiteLlm(model="openai/gpt-5-mini-2025-08-07"),
-        name="dataset_creator_agent",
-        description='An expert agent who finds and downloads datasets based on user requirements',
-        instruction="""
-        You are an expert dataset creator. Your task is to fetch high-quality datasets for the user.
+def get_dataset_requirements() -> str:
+    """
+    Load the user's report and goal from pipeline_state.json.
+    This gives the agent context for what datasets to search for.
 
-        If the dataset is present, skip searching and fetching steps.
-
-        If the dataset is NOT present, follow these steps:
-        1. Use search_datasets to find relevant datasets on Kaggle or HuggingFace for the user's problem
-        2. Analyze the search results and identify the most relevant dataset
-        3. Use download_kaggle_dataset for Kaggle datasets (format: 'username/dataset-name')
-            OR download_huggingface_dataset for HuggingFace datasets (format: 'username/dataset-name')
-        4. Provide a summary of the downloaded dataset and its location
-
-        IMPORTANT:
-        - Actually call the download functions with the exact dataset names from the search results
-        - Extract the dataset identifier from URLs:
-          * For Kaggle: ONLY use URLs containing '/datasets/' (NOT '/code/')
-          * From 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name'
-          * For HuggingFace: From 'huggingface.co/datasets/username/dataset-name' extract 'username/dataset-name'
-        - Skip any results that are code notebooks or kernels (URLs containing '/code/' or '/kernels/')
-        """,
-        tools=[search_datasets, download_kaggle_dataset, download_huggingface_dataset]
-    )
-
-    app_name = 'my_agent_app'
-    user_id = 'user1'
-    session_id = 'session1'
-
-    session_service = InMemorySessionService()
-
-    # Use async versions of session methods
-    existing_session = await session_service.get_session(
-        app_name=app_name, user_id=user_id, session_id=session_id
-    )
-
-    if existing_session is None:
-        print(f"[INFO] Creating new session and running agent.", flush=True)
-        await session_service.create_session(
-            app_name=app_name, user_id=user_id, session_id=session_id
-        )
-    else:
-        print(f"[INFO] Session already exists. Reusing session.", flush=True)
-
-    runner = Runner(
-        app_name=app_name,
-        agent=root_agent,
-        session_service=session_service,
-    )
-
-    # Load dataset requirements from shared pipeline state
+    Returns:
+        JSON string with the user's goal and report.
+    """
     state = load_state()
-    user_input = state.get("report") or state.get("user_goal")
-    if not user_input:
-        print("[ERROR] No data found in pipeline_state.json. Run main.py first.")
-        return
-    print(f"[INFO] Loaded requirements from pipeline state (status: {state.get('status')})", flush=True)
-
-    print(f"[INFO] Dataset requirements: {user_input}", flush=True)
-
-    new_message = types.Content(
-        role="user",
-        parts=[types.Part(text=user_input)],
-    )
-
-    # Use async runner
-    async for event in runner.run_async(
-        user_id=user_id,
-        session_id=session_id,
-        new_message=new_message,
-    ):
-        if event.is_final_response and event.content and event.content.parts:
-            print(f"Agent: {event.content.parts[0].text}")
+    requirements = {
+        "user_goal": state.get("user_goal", ""),
+        "report": state.get("report", "")[:5000] if state.get("report") else "",
+        "status": state.get("status", ""),
+    }
+    return json.dumps(requirements, indent=2)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# ============================================================
+# AGENT DEFINITION
+# ============================================================
+
+from google.adk.agents import Agent
+
+# MCP toolsets — commented out for now, uncomment when MCP servers are ready
+# sys.path.append(str(Path(__file__).parent.parent))
+# from mcp_servers.mcp_servers import tavily_mcp, hugging_face_mcp
+
+dataset_extractor_agent = Agent(
+    model="gemini-3.1-flash-lite-preview",
+    name="dataset_extractor_agent",
+    description="Searches Kaggle and HuggingFace for relevant datasets and downloads them.",
+    instruction="""You are the Dataset Extractor Agent. Your task is to find and download the best datasets for the user's ML project.
+
+WORKFLOW:
+1. Call get_dataset_requirements to understand what the user needs.
+2. Use search_datasets to find relevant datasets on Kaggle or HuggingFace.
+3. Analyze the search results — pick the MOST relevant datasets (prefer Kaggle for tabular data).
+4. Download 1-3 of the best datasets using download_kaggle_dataset or download_huggingface_dataset.
+5. Respond with a summary of what was downloaded and where.
+
+IMPORTANT:
+- Actually call the download functions with the exact dataset identifiers.
+- Extract dataset identifiers from URLs:
+  * For Kaggle: ONLY use URLs containing '/datasets/' (NOT '/code/')
+  * From 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name'
+  * For HuggingFace: From 'huggingface.co/datasets/username/dataset-name' extract 'username/dataset-name'
+- Skip any results that are code notebooks or kernels (URLs with '/code/' or '/kernels/')
+- If no good datasets are found, try different search queries
+- Download at least 1 dataset, preferably 2-3 for Agent 1 to choose from
+""",
+    tools=[
+        get_dataset_requirements,
+        search_datasets,
+        download_kaggle_dataset,
+        download_huggingface_dataset,
+        # tavily_mcp,
+        # hugging_face_mcp,
+    ],
+)
+
+# For ADK compatibility (adk web / adk run)
+root_agent = dataset_extractor_agent
