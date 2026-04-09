@@ -32,7 +32,7 @@ from pipeline_state import load_state, save_state
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3-flash-preview"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 
 
