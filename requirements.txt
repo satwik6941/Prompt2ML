@@ -1,7 +1,6 @@
 google-adk
 google-genai
 litellm
-openai
 kaggle
 kagglehub
 datasets
