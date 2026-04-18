@@ -37,3 +37,14 @@ tavily_mcp = McpToolset(
         timeout=120,
     ),
 )
+
+colab_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uv",
+            args=["run", "colab-mcp"],
+            cwd="/path/to/github/colab-mcp",
+            timeout=30000
+        )
+    ),
+)           
