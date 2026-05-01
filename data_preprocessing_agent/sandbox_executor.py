@@ -1,265 +1,310 @@
 """
-OpenSandbox Executor — Secure code execution for data preprocessing agents.
+SafeExecute Executor — Secure code execution for data preprocessing agents.
 
-Provides three ADK-compatible async tool functions:
-    - run_in_sandbox(command)      → execute shell commands
-    - write_file_to_sandbox(path, content) → write files into sandbox
-    - read_file_from_sandbox(path) → read files from sandbox
+Replaces OpenSandbox. Uses SafeExecute (https://github.com/Josh-XT/SafeExecute)
+which manages Docker containers directly — no separate server process required.
 
-The sandbox is a Docker container with Python + data science libraries.
-It is created once and reused across all tool calls, then killed at the end.
+Key difference from OpenSandbox:
+  - The host's MODIFIED_DATASETS_DIR is mounted as /workspace inside the container.
+  - Files written there by built-in tools are immediately visible to sandbox scripts.
+  - No upload/download step needed for dataset files already on disk.
 
-Usage:
-    executor = SandboxExecutor()
-    await executor.start()
-    # ... use executor.run_in_sandbox, executor.write_file_to_sandbox, etc.
-    await executor.stop()
+Tool functions exposed to ADK agents:
+    start_sandbox()                          — pull image, warm up container
+    stop_sandbox()                           — remove container, free resources
+    run_in_sandbox(code)                     — execute Python code in container
+    write_file_to_sandbox(filename, content) — write a script into /workspace
+    read_file_from_sandbox(filename)         — read a file from /workspace
+
+ERROR HANDLING:
+  - start_sandbox returns {"error": "...", "error_type": "docker_not_running"} when
+    Docker Desktop is not started. Agents MUST check for "error" key before proceeding.
+  - run_in_sandbox returns {"success": False, "error_type": "..."} on failure.
+  - Agents should degrade gracefully: skip sandbox steps if Docker unavailable,
+    then note this in their output rather than crashing the pipeline.
 """
 
-import os
 import json
-from datetime import timedelta
+import os
+import sys
 from pathlib import Path
-from opensandbox import Sandbox
-from opensandbox.config import ConnectionConfig
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from pipeline_state import get_run_dir, reset_run_dir_cache
+
+# Resolved at sandbox start time (not import time) so the slug is always
+# based on the user_goal that was already saved to pipeline_state.json.
+# WORKSPACE is set by start_sandbox() and reused by run_in_sandbox().
+WORKSPACE: str = ""
+
+# Stable conversation ID — one container per pipeline run
+_CONVERSATION_ID = "prompt2ml_pipeline"
+
+# Module-level flag so start/stop are idempotent
+_started = False
 
 
-# Default sandbox image with Python + data science libs
-DEFAULT_IMAGE = "opensandbox/code-interpreter:v1.0.2"
-
-# Paths inside the sandbox
-SANDBOX_DATA_DIR = "/workspace/data"
-SANDBOX_OUTPUT_DIR = "/workspace/output"
-
-
-class SandboxExecutor:
-    """Manages an OpenSandbox container lifecycle and provides tool functions."""
-
-    def __init__(
-        self,
-        domain: str = None,
-        api_key: str = None,
-        image: str = None,
-        timeout_minutes: int = 30,
-    ):
-        self.domain = domain or os.getenv("SANDBOX_DOMAIN", "localhost:8080")
-        self.api_key = api_key or os.getenv("SANDBOX_API_KEY")
-        self.image = image or os.getenv("SANDBOX_IMAGE", DEFAULT_IMAGE)
-        self.timeout_minutes = timeout_minutes
-        self.sandbox = None
-
-    async def start(self):
-        """Create and start the sandbox container."""
-        config = ConnectionConfig(
-            domain=self.domain,
-            api_key=self.api_key,
-            request_timeout=timedelta(seconds=120),
-        )
-
-        self.sandbox = await Sandbox.create(
-            self.image,
-            connection_config=config,
-            entrypoint=["/opt/opensandbox/code-interpreter.sh"],
-            env={"PYTHON_VERSION": "3.11"},
-            timeout=timedelta(minutes=self.timeout_minutes),
-        )
-
-        # Create working directories inside sandbox
-        await self.sandbox.commands.run(f"mkdir -p {SANDBOX_DATA_DIR} {SANDBOX_OUTPUT_DIR}")
-        print(f"[SANDBOX] Started sandbox container", flush=True)
-
-    async def stop(self):
-        """Kill and clean up the sandbox container."""
-        if self.sandbox:
-            try:
-                await self.sandbox.kill()
-                await self.sandbox.close()
-                print("[SANDBOX] Sandbox container stopped", flush=True)
-            except Exception as e:
-                print(f"[SANDBOX] Warning during cleanup: {e}", flush=True)
-            self.sandbox = None
-
-    async def upload_dataset(self, local_path: str) -> str:
-        """
-        Upload a local dataset file into the sandbox.
-        Returns the path inside the sandbox.
-        """
-        local_file = Path(local_path)
-        if not local_file.exists():
-            return json.dumps({"error": f"Local file not found: {local_path}"})
-
-        sandbox_path = f"{SANDBOX_DATA_DIR}/{local_file.name}"
-        content = local_file.read_text(encoding="utf-8", errors="ignore")
-        await self.sandbox.files.write_file(sandbox_path, content)
-        print(f"[SANDBOX] Uploaded {local_file.name} → {sandbox_path}", flush=True)
-        return sandbox_path
-
-    async def download_file(self, sandbox_path: str, local_path: str) -> str:
-        """
-        Download a file from the sandbox to the local filesystem.
-        Returns the local path.
-        """
-        content = await self.sandbox.files.read_file(sandbox_path)
-        local_file = Path(local_path)
-        local_file.parent.mkdir(parents=True, exist_ok=True)
-        local_file.write_text(content, encoding="utf-8")
-        print(f"[SANDBOX] Downloaded {sandbox_path} → {local_path}", flush=True)
-        return local_path
+def _ensure_workspace() -> str:
+    """Resolve the run-specific workspace and ensure it exists. Returns the path string."""
+    run_dir = get_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return str(run_dir)
 
 
-# ============================================================
-# Module-level singleton — shared across all tool calls
-# ============================================================
-
-_executor = SandboxExecutor()
+def _is_docker_error(exc: Exception) -> bool:
+    """Return True if the exception looks like Docker daemon is not running."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "pipe", "createfile", "cannot find the file", "docker", "connection refused",
+        "fetching server api", "is the docker daemon running",
+    ))
 
 
 async def start_sandbox() -> str:
     """
-    Start the OpenSandbox container. Call this ONCE at the beginning
-    of preprocessing before using any other sandbox tools.
+    Pull the SafeExecute Docker image and warm up the sandbox container.
+    The host's modified_datasets/ folder is mounted as /workspace inside the container.
+    Call this ONCE before using run_in_sandbox or write_file_to_sandbox.
 
     Returns:
-        Confirmation message with sandbox status.
+        JSON with "status": "sandbox_started" on success.
+        JSON with "error" and "error_type" on failure — check for "error" key before proceeding.
+        If error_type == "docker_not_running": start Docker Desktop and retry.
+        If error_type == "import_error": run `pip install safeexecute`.
     """
-    await _executor.start()
-    return json.dumps({"status": "sandbox_started", "data_dir": SANDBOX_DATA_DIR, "output_dir": SANDBOX_OUTPUT_DIR})
+    global _started, WORKSPACE
+    WORKSPACE = _ensure_workspace()   # resolve run-dir now that user_goal is in state
+
+    try:
+        from safeexecute import execute_python_code
+    except ImportError:
+        msg = "safeexecute package not installed. Run: pip install safeexecute"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({
+            "error": msg,
+            "error_type": "import_error",
+            "action": "Run `pip install safeexecute` then retry.",
+        })
+
+    try:
+        warmup_code = "import sys; print(f'Python {sys.version[:6]} ready')"
+        output = execute_python_code(code=warmup_code, working_directory=WORKSPACE)
+        _started = True
+        print(f"[SANDBOX] Started — workspace: {WORKSPACE}", flush=True)
+        print(f"[SANDBOX] {output.strip()}", flush=True)
+        return json.dumps({
+            "status": "sandbox_started",
+            "workspace": WORKSPACE,
+            "container_note": f"host {WORKSPACE} is mounted as /workspace inside the container",
+        })
+    except Exception as e:
+        if _is_docker_error(e):
+            msg = (
+                "Docker Desktop is not running. "
+                "Please start Docker Desktop and wait for it to fully initialise, then retry."
+            )
+            error_type = "docker_not_running"
+        else:
+            msg = f"Failed to start sandbox: {e}"
+            error_type = "sandbox_start_error"
+
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({
+            "error": msg,
+            "error_type": error_type,
+            "action": "Start Docker Desktop (system tray) and call start_sandbox again." if error_type == "docker_not_running" else "Check Docker logs.",
+        })
 
 
 async def stop_sandbox() -> str:
     """
-    Stop and clean up the OpenSandbox container. Call this ONCE
-    after all preprocessing is complete.
+    Remove the sandbox container and free Docker resources.
+    Call this ONCE after all sandbox work is complete.
+    Safe to call even if start_sandbox failed — will be a no-op.
 
     Returns:
-        Confirmation message.
+        JSON confirmation.
     """
-    await _executor.stop()
-    return json.dumps({"status": "sandbox_stopped"})
+    global _started
 
+    if not _started:
+        # Nothing was running — avoid misleading "container removed" log
+        print("[SANDBOX] stop_sandbox called but sandbox was not running — no-op.", flush=True)
+        return json.dumps({"status": "sandbox_not_running", "note": "Nothing to stop."})
+
+    try:
+        from safeexecute import get_container_manager
+        manager = get_container_manager()
+        manager.remove_container(_CONVERSATION_ID)
+        _started = False
+        print("[SANDBOX] Container removed.", flush=True)
+        return json.dumps({"status": "sandbox_stopped"})
+    except Exception as e:
+        _started = False
+        note = str(e)
+        print(f"[SANDBOX] stop_sandbox: container may already be gone ({note})", flush=True)
+        return json.dumps({"status": "sandbox_stopped", "note": note})
+
+
+async def run_in_sandbox(code: str) -> str:
+    """
+    Execute Python code inside the sandbox container.
+
+    The container's /workspace is your host's modified_datasets/ folder.
+    Any CSV files already there (from built-in tools) are readable as:
+        pd.read_csv('/workspace/<filename>.csv')
+
+    Results saved to /workspace/ are immediately available on the host.
+
+    SafeExecute automatically detects missing imports and installs them via pip.
+    Pre-installed: numpy, pandas, scikit-learn, scipy, matplotlib, seaborn,
+                   plotly, openpyxl, xlrd, xlsxwriter, statsmodels, imbalanced-learn.
+
+    Args:
+        code: Python code to execute. Use /workspace/ paths for file I/O.
+
+    Returns:
+        JSON with "success": true and "stdout" on success.
+        JSON with "success": false, "error_type", and "stderr" on failure.
+        Always check "success" before using the output.
+    """
+    if not _started:
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": "Sandbox is not running.",
+            "error_type": "not_started",
+            "action": "Call start_sandbox first. If start_sandbox returned an error, check Docker Desktop is running.",
+        })
+
+    try:
+        from safeexecute import execute_python_code
+        output = execute_python_code(code=code, working_directory=WORKSPACE)
+        return json.dumps({
+            "success": True,
+            "stdout": output.strip(),
+        }, indent=2)
+    except Exception as e:
+        if _is_docker_error(e):
+            error_type = "docker_not_running"
+            action = "Start Docker Desktop and call start_sandbox again."
+        else:
+            error_type = "execution_error"
+            action = "Check the code for syntax errors and try again."
+
+        print(f"[SANDBOX ERROR] run_in_sandbox failed ({error_type}): {e}", flush=True)
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": str(e),
+            "error_type": error_type,
+            "action": action,
+        })
+
+
+async def write_file_to_sandbox(filename: str, content: str) -> str:
+    """
+    Write a Python script or text file into /workspace so run_in_sandbox can execute it.
+
+    Because /workspace is the host's modified_datasets/ folder, this just writes
+    the file to disk — no Docker API call needed. Works even if Docker is not running.
+
+    Args:
+        filename: Filename only (e.g. 'preprocess.py'). Written to modified_datasets/.
+        content: Full text content of the file.
+
+    Returns:
+        JSON with the path written.
+    """
+    workspace = Path(_ensure_workspace())
+    dest = workspace / filename
+    dest.write_text(content, encoding="utf-8")
+    print(f"[SANDBOX] Wrote script → {dest}", flush=True)
+    return json.dumps({
+        "status": "written",
+        "host_path": str(dest),
+        "sandbox_path": f"/workspace/{filename}",
+        "bytes": len(content),
+    })
+
+
+async def read_file_from_sandbox(filename: str) -> str:
+    """
+    Read a file that was written by a sandbox script to /workspace.
+
+    Because /workspace is the host's modified_datasets/ folder, this just reads
+    the file from disk.
+
+    Args:
+        filename: Filename only (e.g. 'result.csv'). Read from modified_datasets/.
+
+    Returns:
+        File content as string (truncated to 50000 chars if large).
+    """
+    src = Path(_ensure_workspace()) / filename
+    if not src.exists():
+        return json.dumps({"error": f"File not found: {src}"})
+
+    content = src.read_text(encoding="utf-8", errors="ignore")
+    if len(content) > 50000:
+        content = content[:50000] + f"\n\n[TRUNCATED — showing first 50000 of {len(content)} chars]"
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility shims
+# With SafeExecute the shared /workspace means no transfer is needed —
+# these functions just return the path that's already accessible.
+# ---------------------------------------------------------------------------
 
 async def upload_dataset_to_sandbox(local_file_path: str) -> str:
     """
-    Upload a local dataset file into the sandbox environment.
-    The file will be available at /workspace/data/<filename> inside the sandbox.
+    No-op shim for backward compatibility.
+    With SafeExecute, modified_datasets/ IS /workspace, so any file already
+    there is immediately accessible. Returns the /workspace path for the file.
 
     Args:
-        local_file_path: Absolute path to the local file to upload.
+        local_file_path: Absolute host path to the file.
 
     Returns:
-        JSON with the sandbox path where the file was uploaded.
+        JSON with the equivalent /workspace path inside the container.
     """
-    sandbox_path = await _executor.upload_dataset(local_file_path)
-    if sandbox_path.startswith("{"):
-        return sandbox_path  # Error JSON
-    return json.dumps({"status": "uploaded", "sandbox_path": sandbox_path, "local_path": local_file_path})
+    local = Path(local_file_path)
+    if not local.exists():
+        return json.dumps({"error": f"File not found: {local_file_path}"})
+
+    sandbox_path = f"/workspace/{local.name}"
+    return json.dumps({
+        "status": "available",
+        "sandbox_path": sandbox_path,
+        "local_path": local_file_path,
+        "note": "No upload needed — modified_datasets/ is mounted as /workspace",
+    })
 
 
-async def run_in_sandbox(command: str) -> str:
+async def download_from_sandbox(sandbox_filename: str, local_path: str) -> str:
     """
-    Run a shell command inside the OpenSandbox container.
-    Use this to execute Python scripts, install packages, or run any shell command.
-
-    The sandbox has Python with pandas, numpy, scikit-learn, scipy, matplotlib, seaborn.
-    Data files are in /workspace/data/ and outputs go to /workspace/output/.
+    No-op shim for backward compatibility.
+    With SafeExecute, files written to /workspace by sandbox scripts are
+    immediately on the host at modified_datasets/<filename>.
+    This function just confirms the file exists.
 
     Args:
-        command: Shell command to execute (e.g. 'python3 /workspace/data/preprocess.py'
-                 or 'pip install xgboost' or 'ls /workspace/data/').
+        sandbox_filename: Filename or /workspace/<filename> path.
+        local_path: Expected local path (for logging).
 
     Returns:
-        JSON with stdout, stderr, and success status.
+        JSON with the local path.
     """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        execution = await _executor.sandbox.commands.run(command)
-        stdout = "\n".join(msg.text for msg in execution.logs.stdout)
-        stderr = "\n".join(msg.text for msg in execution.logs.stderr)
-
-        if execution.error:
-            stderr = "\n".join([
-                stderr,
-                f"[error] {execution.error.name}: {execution.error.value}",
-            ]).strip()
-
+    filename = Path(sandbox_filename).name
+    actual = Path(_ensure_workspace()) / filename
+    if actual.exists():
         return json.dumps({
-            "success": not bool(execution.error),
-            "stdout": stdout.strip(),
-            "stderr": stderr.strip(),
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "stdout": "", "stderr": str(e)})
-
-
-async def write_file_to_sandbox(sandbox_path: str, content: str) -> str:
-    """
-    Write a file inside the sandbox environment.
-    Use this to create Python scripts, config files, or any text file.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/data/preprocess.py').
-        content: The full text content to write.
-
-    Returns:
-        Confirmation with bytes written.
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        await _executor.sandbox.files.write_file(sandbox_path, content)
-        return json.dumps({
-            "status": "written",
-            "path": sandbox_path,
-            "bytes": len(content),
+            "status": "available",
+            "local_path": str(actual),
+            "note": "File already on host — no download needed",
         })
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-async def read_file_from_sandbox(sandbox_path: str) -> str:
-    """
-    Read a file from the sandbox environment.
-    Use this to read results, processed data, or any file.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/output/result.csv').
-
-    Returns:
-        The file content as a string (first 50000 chars if large).
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        content = await _executor.sandbox.files.read_file(sandbox_path)
-        # Truncate very large files to avoid overwhelming the LLM context
-        if len(content) > 50000:
-            content = content[:50000] + f"\n\n[TRUNCATED — showing first 50000 of {len(content)} chars]"
-        return content
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-async def download_from_sandbox(sandbox_path: str, local_path: str) -> str:
-    """
-    Download a file from the sandbox to the local filesystem.
-    Use this to save preprocessed datasets back to the local machine.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/output/preprocessed.csv').
-        local_path: Absolute local path to save the file to.
-
-    Returns:
-        JSON with the local path where the file was saved.
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        result = await _executor.download_file(sandbox_path, local_path)
-        return json.dumps({"status": "downloaded", "sandbox_path": sandbox_path, "local_path": result})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    if Path(local_path).exists():
+        return json.dumps({"status": "available", "local_path": local_path})
+    return json.dumps({"error": f"File not found at {actual} or {local_path}"})

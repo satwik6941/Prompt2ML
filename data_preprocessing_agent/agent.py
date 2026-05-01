@@ -1,4 +1,4 @@
-"""
+﻿"""
 Data Preprocessing Multi-Agent System (Google ADK)
 
 Architecture:
@@ -25,7 +25,7 @@ from typing import AsyncGenerator
 from dotenv import load_dotenv
 
 sys.path.append(str(Path(__file__).parent.parent))
-from pipeline_state import load_state, save_state
+from pipeline_state import load_state, save_state, get_run_dir, reset_run_dir_cache
 
 load_dotenv()
 
@@ -36,7 +36,8 @@ load_dotenv()
 MODEL = "gemini-3.1-flash-lite-preview"
 PROJECT_ROOT = Path(__file__).parent.parent
 DATASETS_DIR = PROJECT_ROOT / "datasets"
-MODIFIED_DATASETS_DIR = PROJECT_ROOT / "modified_datasets"
+MODIFIED_DATASETS_DIR = PROJECT_ROOT / "modified_datasets"   # base root — never written to directly
+# All step files are written to modified_datasets/<problem-slug>/ via get_run_dir()
 
 SUPPORTED_EXTENSIONS = {".csv", ".tsv", ".json", ".jsonl", ".txt", ".parquet", ".xlsx", ".xls"}
 SKIP_EXTENSIONS = {
@@ -216,8 +217,13 @@ def save_selected_dataset(
         }
     }
 
+    existing = load_state().get("agent1_output", [])
+    if not isinstance(existing, list):
+        existing = [existing]
+    existing.append(agent1_output)
+
     save_state({
-        "agent1_output": agent1_output,
+        "agent1_output": existing,
         "selected_dataset_path": selected_file_path,
         "status": "agent1_done",
     })
@@ -241,7 +247,7 @@ def load_dataset_profile() -> str:
     import numpy as np
 
     state = load_state()
-    agent1_out = state.get("agent1_output", {})
+    agent1_out = _latest(state.get("agent1_output"))
     selected = agent1_out.get("selected_dataset", {})
     file_path = selected.get("selected_file_path", "")
 
@@ -351,7 +357,7 @@ def get_user_requirements() -> str:
         "user_goal": state.get("user_goal", ""),
         "qa_pairs": state.get("qa_pairs", []),
         "report_summary": state.get("report", "")[:4000] if state.get("report") else "",
-        "agent1_selection": state.get("agent1_output", {}).get("selected_dataset", {}),
+        "agent1_selection": _latest(state.get("agent1_output")).get("selected_dataset", {}),
     }
     return json.dumps(requirements, indent=2, default=str)
 
@@ -415,8 +421,13 @@ def save_preprocessing_plan(
         "step_by_step_order": step_by_step_order,
     }
 
+    existing = load_state().get("agent2_output", [])
+    if not isinstance(existing, list):
+        existing = [existing]
+    existing.append({"preprocessing_plan": plan})
+
     save_state({
-        "agent2_output": {"preprocessing_plan": plan},
+        "agent2_output": existing,
         "status": "agent2_done",
     })
 
@@ -442,16 +453,19 @@ def _resolve_local_path(p: str) -> str:
             "Empty dataset_path. Built-in tools need an absolute LOCAL path."
         )
 
-    # Sandbox path? Try to remap to local modified_datasets/<basename>
+    # Sandbox path? Try to remap to the run-specific dir first, then base dir
     if p.startswith("/workspace/") or p.startswith("\\workspace\\"):
         basename = os.path.basename(p.replace("\\", "/"))
-        candidate = MODIFIED_DATASETS_DIR / basename
-        if candidate.exists():
-            return str(candidate)
+        run_candidate = get_run_dir() / basename
+        if run_candidate.exists():
+            return str(run_candidate)
+        base_candidate = MODIFIED_DATASETS_DIR / basename
+        if base_candidate.exists():
+            return str(base_candidate)
         raise FileNotFoundError(
             f"Path '{p}' is a SANDBOX path. Built-in tools run on the HOST and "
             f"cannot read sandbox files. Either (1) call download_from_sandbox "
-            f"first to copy the file to '{MODIFIED_DATASETS_DIR / basename}', or "
+            f"first to copy the file to '{run_candidate}', or "
             f"(2) skip the sandbox entirely and use the local path returned by "
             f"the previous built-in tool. Built-in tools never accept /workspace/... paths."
         )
@@ -470,6 +484,89 @@ def _resolve_local_path(p: str) -> str:
     return p
 
 
+def _next_step_path(tool_name: str) -> str:
+    """
+    Generate the next auto-named step output path and increment the step counter.
+    Files are written to modified_datasets/<problem-slug>/step_N_<tool_name>.csv
+    so each pipeline run is isolated in its own subfolder.
+    """
+    state = load_state()
+    step_num = state.get("current_step", 0) + 1
+    save_state({"current_step": step_num})
+    run_dir = get_run_dir()
+    return str(run_dir / f"step_{step_num}_{tool_name}.csv")
+
+
+def _latest(value) -> dict:
+    """
+    Safely get the latest entry from a field that may be a list (new format)
+    or a plain dict (old format from pipeline_state.json written before this change).
+    Returns an empty dict if the value is missing or empty.
+    """
+    if isinstance(value, list):
+        return value[-1] if value else {}
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def _parse_json_param(param: str, param_name: str) -> tuple:
+    """
+    Safely parse a JSON string parameter from an agent tool call.
+    Returns (parsed_value, None) on success, or (None, error_json_string) on failure.
+    The caller should check: if err is not None: return err
+    """
+    try:
+        return json.loads(param), None
+    except (json.JSONDecodeError, TypeError) as e:
+        err = json.dumps({
+            "error": f"Invalid JSON in parameter '{param_name}': {e}",
+            "received": str(param)[:200],
+            "fix": f"Pass a valid JSON string for '{param_name}'.",
+        }, indent=2)
+        return None, err
+
+
+def _safe_read_csv(path: str):
+    """
+    Read a CSV file with graceful error handling for encoding issues and corruption.
+    Returns (dataframe, None) on success, or (None, error_json_string) on failure.
+    """
+    import pandas as pd
+    encodings = ["utf-8", "latin-1", "cp1252"]
+    last_err = None
+    for enc in encodings:
+        try:
+            return pd.read_csv(path, encoding=enc), None
+        except UnicodeDecodeError:
+            last_err = f"Encoding error with {enc}"
+        except Exception as e:
+            last_err = str(e)
+            break
+    err = json.dumps({
+        "error": f"Could not read CSV: {last_err}",
+        "path": path,
+        "fix": "Ensure the file exists and is a valid CSV. Check encoding.",
+    }, indent=2)
+    return None, err
+
+
+def _safe_write_csv(df, output_path: str) -> str | None:
+    """
+    Write a DataFrame to CSV with error handling.
+    Returns None on success, or an error JSON string on failure.
+    """
+    try:
+        df.to_csv(output_path, index=False)
+        return None
+    except OSError as e:
+        return json.dumps({
+            "error": f"Could not write output file: {e}",
+            "path": output_path,
+            "fix": "Check disk space and write permissions for the modified_datasets/ folder.",
+        }, indent=2)
+
+
 def get_preprocessing_context() -> str:
     """
     Load everything Agent 3 needs: user goal, Agent 1's dataset selection,
@@ -477,13 +574,17 @@ def get_preprocessing_context() -> str:
     validation feedback from Agent 4 (for retry loops).
     """
     state = load_state()
+    agent1_output = state.get("agent1_output", [])
+    agent2_output = state.get("agent2_output", [])
     context = {
         "user_goal": state.get("user_goal", ""),
-        "selected_dataset": state.get("agent1_output", {}).get("selected_dataset", {}),
-        "preprocessing_plan": state.get("agent2_output", {}).get("preprocessing_plan", {}),
+        "selected_dataset": _latest(agent1_output).get("selected_dataset", {}),
+        "preprocessing_plan": _latest(agent2_output).get("preprocessing_plan", {}),
         "dataset_path": state.get("selected_dataset_path", ""),
         "validation_feedback": state.get("agent4_feedback", ""),
         "iteration": state.get("loop_iteration", 0),
+        "previous_attempts": state.get("agent3_iterations", []),
+        "previous_validations": state.get("agent4_iterations", []),
     }
     return json.dumps(context, indent=2, default=str)
 
@@ -491,7 +592,6 @@ def get_preprocessing_context() -> str:
 def handle_missing_values(
     dataset_path: str,
     strategy_json: str,
-    output_path: str,
 ) -> str:
     """
     Handle missing values in the dataset using column-specific strategies.
@@ -502,27 +602,45 @@ def handle_missing_values(
             Example: '{"age": "fill_median", "city": "fill_mode", "temp": "fill_mean", "id": "drop_rows"}'
             Supported strategies: fill_mean, fill_median, fill_mode, fill_zero,
             fill_ffill, fill_bfill, fill_interpolate, drop_rows, drop_column.
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with before/after missing counts and rows affected.
     """
     import pandas as pd
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
+    output_path = _next_step_path("handle_missing")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
     before_missing = df.isnull().sum().to_dict()
     before_rows = len(df)
+    warnings = []
 
-    strategies = json.loads(strategy_json)
+    strategies, err = _parse_json_param(strategy_json, "strategy_json")
+    if err:
+        return err
 
     for col, strategy in strategies.items():
         if col not in df.columns:
             continue
         if strategy == "fill_mean":
-            df[col] = df[col].fillna(df[col].mean())
+            mean_val = df[col].mean()
+            if pd.isna(mean_val):
+                warnings.append(f"{col}: fill_mean skipped — column is entirely null (mean is NaN)")
+                continue
+            df[col] = df[col].fillna(mean_val)
         elif strategy == "fill_median":
-            df[col] = df[col].fillna(df[col].median())
+            median_val = df[col].median()
+            if pd.isna(median_val):
+                warnings.append(f"{col}: fill_median skipped — column is entirely null")
+                continue
+            df[col] = df[col].fillna(median_val)
         elif strategy == "fill_mode":
             mode_val = df[col].mode()
             if len(mode_val) > 0:
@@ -540,7 +658,10 @@ def handle_missing_values(
         elif strategy == "drop_column":
             df = df.drop(columns=[col])
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
+
     after_missing = df.isnull().sum().to_dict()
 
     return json.dumps({
@@ -549,6 +670,7 @@ def handle_missing_values(
         "after_missing": {k: v for k, v in after_missing.items() if v > 0},
         "rows_before": before_rows,
         "rows_after": len(df),
+        "warnings": warnings,
         "output_path": output_path,
     }, indent=2)
 
@@ -557,7 +679,6 @@ def remove_duplicates(
     dataset_path: str,
     strategy: str,
     subset_columns: str,
-    output_path: str,
 ) -> str:
     """
     Remove duplicate rows from the dataset.
@@ -567,16 +688,35 @@ def remove_duplicates(
         strategy: One of 'keep_first', 'keep_last', 'drop_all'.
         subset_columns: Comma-separated column names to check for duplicates,
             or 'all' to check all columns.
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with duplicate count before/after and rows removed.
     """
     import pandas as pd
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    subset = None if subset_columns == "all" else [c.strip() for c in subset_columns.split(",")]
+    output_path = _next_step_path("remove_duplicates")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    if strategy not in ("keep_first", "keep_last", "drop_all"):
+        return json.dumps({
+            "error": f"Unknown strategy '{strategy}'. Use: keep_first, keep_last, drop_all.",
+        }, indent=2)
+
+    subset = None if subset_columns.strip().lower() == "all" else [c.strip() for c in subset_columns.split(",") if c.strip()]
+    # Validate subset columns exist
+    if subset:
+        missing = [c for c in subset if c not in df.columns]
+        if missing:
+            return json.dumps({
+                "error": f"Subset columns not found: {missing}. Available: {list(df.columns)}",
+            }, indent=2)
 
     before_dupes = int(df.duplicated(subset=subset).sum())
 
@@ -587,7 +727,9 @@ def remove_duplicates(
     elif strategy == "drop_all":
         df = df.drop_duplicates(subset=subset, keep=False)
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -601,7 +743,6 @@ def remove_duplicates(
 def drop_columns(
     dataset_path: str,
     columns_to_drop: str,
-    output_path: str,
 ) -> str:
     """
     Drop specified columns from the dataset.
@@ -609,20 +750,33 @@ def drop_columns(
     Args:
         dataset_path: Absolute path to the input CSV file.
         columns_to_drop: Comma-separated column names to drop.
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with columns dropped and remaining columns.
     """
     import pandas as pd
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
+    output_path = _next_step_path("drop_columns")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
     cols = [c.strip() for c in columns_to_drop.split(",") if c.strip()]
+    if not cols:
+        return json.dumps({"error": "columns_to_drop is empty. Provide at least one column name."}, indent=2)
+
     existing = [c for c in cols if c in df.columns]
     missing = [c for c in cols if c not in df.columns]
     df = df.drop(columns=existing)
-    df.to_csv(output_path, index=False)
+
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -636,7 +790,6 @@ def drop_columns(
 def encode_categorical_columns(
     dataset_path: str,
     encoding_json: str,
-    output_path: str,
 ) -> str:
     """
     Encode categorical columns using specified methods.
@@ -647,7 +800,6 @@ def encode_categorical_columns(
             Example: '{"city": "onehot", "grade": "label", "browser": "frequency", "size": "ordinal:S,M,L,XL"}'
             Supported: 'label', 'onehot', 'frequency', 'ordinal:val1,val2,...' (ordered),
             'binary' (for 2-class columns), 'target:target_col' (target/mean encoding).
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with encoding details per column and new column list.
@@ -655,9 +807,20 @@ def encode_categorical_columns(
     import pandas as pd
     from sklearn.preprocessing import LabelEncoder
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    encodings = json.loads(encoding_json)
+    output_path = _next_step_path("encode_categoricals")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    encodings, err = _parse_json_param(encoding_json, "encoding_json")
+    if err:
+        return err
+
     details = {}
 
     for col, method in encodings.items():
@@ -671,6 +834,14 @@ def encode_categorical_columns(
             details[col] = {"method": "label", "classes": list(le.classes_)}
 
         elif method == "onehot":
+            n_unique = df[col].nunique()
+            if n_unique > 50:
+                details[col] = {
+                    "status": "skipped",
+                    "reason": f"onehot skipped — {n_unique} unique values would create {n_unique} columns. "
+                               "Use 'frequency' or 'hash:32' for high-cardinality columns instead.",
+                }
+                continue
             dummies = pd.get_dummies(df[col], prefix=col, drop_first=True)
             df = pd.concat([df.drop(columns=[col]), dummies], axis=1)
             details[col] = {"method": "onehot", "new_columns": list(dummies.columns)}
@@ -703,7 +874,9 @@ def encode_categorical_columns(
             else:
                 details[col] = {"status": "skipped", "reason": f"target column '{target_col}' not found"}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -717,7 +890,6 @@ def scale_numeric_columns(
     dataset_path: str,
     scaling_json: str,
     exclude_columns: str,
-    output_path: str,
 ) -> str:
     """
     Scale/normalize numeric columns using specified methods.
@@ -731,7 +903,6 @@ def scale_numeric_columns(
             'log' (log1p transform), 'maxabs' (scale by max absolute value),
             'power_yeo' (Yeo-Johnson power transform for skewed data).
         exclude_columns: Comma-separated column names to NEVER scale (e.g., target column, IDs).
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with scaling details per column.
@@ -740,11 +911,23 @@ def scale_numeric_columns(
     import numpy as np
     from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, MaxAbsScaler, PowerTransformer
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    scalings = json.loads(scaling_json)
+    output_path = _next_step_path("scale_numerics")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    scalings, err = _parse_json_param(scaling_json, "scaling_json")
+    if err:
+        return err
+
     exclude = {c.strip() for c in exclude_columns.split(",") if c.strip()}
     details = {}
+    warnings = []
 
     numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in exclude]
 
@@ -757,35 +940,54 @@ def scale_numeric_columns(
     for col, method in col_methods.items():
         if col not in df.columns:
             continue
-        before_stats = {"mean": round(float(df[col].mean()), 4), "std": round(float(df[col].std()), 4)}
+        col_std = float(df[col].std())
+        col_range = float(df[col].max() - df[col].min()) if len(df[col].dropna()) > 0 else 0
+        before_stats = {"mean": round(float(df[col].mean()), 4), "std": round(col_std, 4)}
 
-        if method == "standard":
-            scaler = StandardScaler()
-            df[col] = scaler.fit_transform(df[[col]])
-        elif method == "minmax":
-            scaler = MinMaxScaler()
-            df[col] = scaler.fit_transform(df[[col]])
-        elif method == "robust":
-            scaler = RobustScaler()
-            df[col] = scaler.fit_transform(df[[col]])
-        elif method == "log":
-            df[col] = np.log1p(df[col].clip(lower=0))
-        elif method == "maxabs":
-            scaler = MaxAbsScaler()
-            df[col] = scaler.fit_transform(df[[col]])
-        elif method == "power_yeo":
-            pt = PowerTransformer(method="yeo-johnson")
-            df[col] = pt.fit_transform(df[[col]])
+        # Guard: constant column — scaling would produce NaN
+        if method in ("standard", "minmax", "maxabs") and col_std == 0:
+            warnings.append(f"{col}: skipped '{method}' — column is constant (std=0), scaling would produce NaN.")
+            details[col] = {"method": method, "status": "skipped", "reason": "constant column (std=0)"}
+            continue
+
+        try:
+            if method == "standard":
+                scaler = StandardScaler()
+                df[col] = scaler.fit_transform(df[[col]])
+            elif method == "minmax":
+                scaler = MinMaxScaler()
+                df[col] = scaler.fit_transform(df[[col]])
+            elif method == "robust":
+                scaler = RobustScaler()
+                df[col] = scaler.fit_transform(df[[col]])
+            elif method == "log":
+                n_negative = int((df[col] < 0).sum())
+                if n_negative > 0:
+                    warnings.append(f"{col}: log scaling — {n_negative} negative values clipped to 0 before log1p.")
+                df[col] = np.log1p(df[col].clip(lower=0))
+            elif method == "maxabs":
+                scaler = MaxAbsScaler()
+                df[col] = scaler.fit_transform(df[[col]])
+            elif method == "power_yeo":
+                pt = PowerTransformer(method="yeo-johnson")
+                df[col] = pt.fit_transform(df[[col]])
+        except Exception as e:
+            warnings.append(f"{col}: {method} failed — {e}")
+            details[col] = {"method": method, "status": "error", "reason": str(e)}
+            continue
 
         after_stats = {"mean": round(float(df[col].mean()), 4), "std": round(float(df[col].std()), 4)}
         details[col] = {"method": method, "before": before_stats, "after": after_stats}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
         "scaling_details": details,
         "excluded": list(exclude),
+        "warnings": warnings,
         "output_path": output_path,
     }, indent=2)
 
@@ -793,7 +995,6 @@ def scale_numeric_columns(
 def handle_outliers(
     dataset_path: str,
     outlier_json: str,
-    output_path: str,
 ) -> str:
     """
     Detect and handle outliers in numeric columns.
@@ -810,7 +1011,6 @@ def handle_outliers(
             - 'winsorize:5,95' — clip to given percentiles
             - 'log_transform' — apply log1p (compresses extreme values)
             - 'keep' — do nothing
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with outlier counts before/after per column.
@@ -818,10 +1018,22 @@ def handle_outliers(
     import pandas as pd
     import numpy as np
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    strategies = json.loads(outlier_json)
+    output_path = _next_step_path("handle_outliers")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    strategies, err = _parse_json_param(outlier_json, "outlier_json")
+    if err:
+        return err
+
     details = {}
+    warnings = []
     before_rows = len(df)
 
     for col, strategy in strategies.items():
@@ -873,13 +1085,16 @@ def handle_outliers(
 
         details[col] = {"strategy": strategy, "outliers_before": before_outliers, "outliers_after": after_outliers}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
         "outlier_details": details,
         "rows_before": before_rows,
         "rows_after": len(df),
+        "warnings": warnings,
         "output_path": output_path,
     }, indent=2)
 
@@ -887,7 +1102,6 @@ def handle_outliers(
 def parse_datetime_columns(
     dataset_path: str,
     datetime_json: str,
-    output_path: str,
 ) -> str:
     """
     Parse datetime columns and extract useful time features.
@@ -899,16 +1113,26 @@ def parse_datetime_columns(
             Supported extractions: year, month, day, dayofweek (0=Mon), hour, minute,
             is_weekend (0/1), quarter, week_of_year, days_since_earliest, time_of_day (morning/afternoon/evening/night).
             The original column will be dropped after extraction.
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with new columns created per datetime column.
     """
     import pandas as pd
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    configs = json.loads(datetime_json)
+    output_path = _next_step_path("parse_datetime")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    configs, err = _parse_json_param(datetime_json, "datetime_json")
+    if err:
+        return err
+
     details = {}
 
     for col, features_str in configs.items():
@@ -957,9 +1181,15 @@ def parse_datetime_columns(
             new_cols.append(new_col)
 
         df = df.drop(columns=[col])
-        details[col] = {"status": "success", "new_columns": new_cols, "null_dates": int(dt.isnull().sum())}
+        null_dates = int(dt.isnull().sum())
+        detail = {"status": "success", "new_columns": new_cols, "null_dates": null_dates}
+        if null_dates > 0:
+            detail["warning"] = f"{null_dates} dates could not be parsed and became NaT."
+        details[col] = detail
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -972,7 +1202,6 @@ def parse_datetime_columns(
 def engineer_features(
     dataset_path: str,
     features_json: str,
-    output_path: str,
 ) -> str:
     """
     Create new engineered features from existing columns.
@@ -1002,7 +1231,6 @@ def engineer_features(
             - 'multiply:<col1>,<col2>' — product of two columns
             - 'add:<col1>,<col2>' — sum of two columns
             - 'subtract:<col1>,<col2>' — difference: col1 - col2
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with created features and their basic stats.
@@ -1010,9 +1238,20 @@ def engineer_features(
     import pandas as pd
     import numpy as np
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    features = json.loads(features_json)
+    output_path = _next_step_path("engineer_features")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    features, err = _parse_json_param(features_json, "features_json")
+    if err:
+        return err
+
     details = {}
 
     for new_col, definition in features.items():
@@ -1065,6 +1304,19 @@ def engineer_features(
                 cols = definition.split(":")[1].split(",")
                 df[new_col] = df[cols[0].strip()] - df[cols[1].strip()]
 
+            else:
+                op_prefix = definition.split(":")[0] if ":" in definition else definition
+                details[new_col] = {
+                    "status": "unsupported_operation",
+                    "definition": definition,
+                    "reason": (
+                        f"Operation '{op_prefix}' is not a built-in supported operation. "
+                        "Group-aware ops (shift by group, rolling by group, etc.) must be done "
+                        "via run_in_sandbox. Skipping this feature — pipeline continues."
+                    ),
+                }
+                continue
+
             stats = {}
             if df[new_col].dtype in ["int64", "float64"]:
                 stats = {
@@ -1082,7 +1334,9 @@ def engineer_features(
         except Exception as e:
             details[new_col] = {"status": "error", "reason": str(e)}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -1095,7 +1349,6 @@ def engineer_features(
 def process_text_columns(
     dataset_path: str,
     text_json: str,
-    output_path: str,
 ) -> str:
     """
     Process text/string columns — extract features or transform them for ML.
@@ -1113,7 +1366,6 @@ def process_text_columns(
             - 'clean_and_keep' — lowercase, strip whitespace, remove special chars, keep column
             - 'hash:<n_buckets>' — hash encoding into N buckets (for high-cardinality columns)
             - 'drop' — simply drop the column
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with processing details per text column.
@@ -1122,9 +1374,20 @@ def process_text_columns(
     import numpy as np
     import re
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    configs = json.loads(text_json)
+    output_path = _next_step_path("process_text")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    configs, err = _parse_json_param(text_json, "text_json")
+    if err:
+        return err
+
     details = {}
 
     for col, method in configs.items():
@@ -1186,7 +1449,9 @@ def process_text_columns(
         except Exception as e:
             details[col] = {"status": "error", "reason": str(e)}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -1199,7 +1464,6 @@ def process_text_columns(
 def detect_and_fix_data_types(
     dataset_path: str,
     type_fixes_json: str,
-    output_path: str,
 ) -> str:
     """
     Detect mistyped columns and cast them to correct types.
@@ -1210,16 +1474,26 @@ def detect_and_fix_data_types(
             Example: '{"price": "float", "age": "int", "is_active": "bool", "date": "datetime", "category": "category"}'
             Supported types: 'int', 'float', 'str', 'bool', 'datetime', 'category'.
             Use 'auto' to let pandas infer the best type for a column.
-        output_path: Absolute path to save the result CSV.
 
     Returns:
         JSON with type changes per column and any conversion errors.
     """
     import pandas as pd
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    fixes = json.loads(type_fixes_json)
+    output_path = _next_step_path("fix_data_types")
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    fixes, err = _parse_json_param(type_fixes_json, "type_fixes_json")
+    if err:
+        return err
+
     details = {}
 
     for col, target_type in fixes.items():
@@ -1253,7 +1527,9 @@ def detect_and_fix_data_types(
         except Exception as e:
             details[col] = {"status": "error", "from": before_type, "reason": str(e)}
 
-    df.to_csv(output_path, index=False)
+    write_err = _safe_write_csv(df, output_path)
+    if write_err:
+        return write_err
 
     return json.dumps({
         "status": "success",
@@ -1292,9 +1568,19 @@ def validate_dataset(
     import pandas as pd
     import numpy as np
 
-    dataset_path = _resolve_local_path(dataset_path)
-    df = pd.read_csv(dataset_path)
-    checks = json.loads(checks_json)
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    df, err = _safe_read_csv(dataset_path)
+    if err:
+        return err
+
+    checks, err = _parse_json_param(checks_json, "checks_json")
+    if err:
+        return err
+
     results = {}
     all_passed = True
 
@@ -1370,9 +1656,43 @@ def validate_dataset(
     return json.dumps(results, indent=2)
 
 
-# NOTE: Custom code execution is handled by OpenSandbox tools
+# NOTE: Custom code execution is handled by SafeExecute tools
 # (run_in_sandbox, write_file_to_sandbox, read_file_from_sandbox).
 # These are regular async functions that CAN be mixed with other tools.
+
+
+def log_sandbox_step(
+    step_name: str,
+    script: str,
+    stdout: str,
+    purpose: str,
+) -> str:
+    """
+    Log a sandbox execution step so Agent 4 can verify it.
+    Call this AFTER every run_in_sandbox call, passing the script that ran and its stdout.
+
+    Args:
+        step_name: Short name for this step (e.g. 'custom_smote', 'custom_feature_engineer').
+        script: The full Python script that was written to the sandbox and executed.
+        stdout: The stdout output returned by run_in_sandbox.
+        purpose: One sentence describing what this step was supposed to do.
+
+    Returns:
+        Confirmation message.
+    """
+    state = load_state()
+    iteration = state.get("loop_iteration", 0)
+    entry = {
+        "iteration": iteration,
+        "step_name": step_name,
+        "script": script,
+        "stdout": stdout,
+        "purpose": purpose,
+    }
+    existing = state.get("agent3_sandbox_log", [])
+    existing.append(entry)
+    save_state({"agent3_sandbox_log": existing})
+    return json.dumps({"status": "logged", "step_name": step_name}, indent=2)
 
 
 def save_preprocessed_output(
@@ -1396,21 +1716,39 @@ def save_preprocessed_output(
     """
     import shutil
 
-    MODIFIED_DATASETS_DIR.mkdir(parents=True, exist_ok=True)
-    dest = MODIFIED_DATASETS_DIR / output_filename
+    run_dir = get_run_dir()
+    dest = run_dir / output_filename
 
-    dataset_path = _resolve_local_path(dataset_path)
-    shutil.copy2(dataset_path, dest)
+    try:
+        dataset_path = _resolve_local_path(dataset_path)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)}, indent=2)
+
+    try:
+        shutil.copy2(dataset_path, dest)
+    except OSError as e:
+        return json.dumps({
+            "error": f"Could not copy preprocessed file to output: {e}",
+            "source": dataset_path,
+            "destination": str(dest),
+        }, indent=2)
+
+    iteration = load_state().get("loop_iteration", 0)
+    agent3_entry = {
+        "iteration": iteration,
+        "preprocessed_file": str(dest),
+        "summary": summary,
+        "steps_completed": [s.strip() for s in steps_completed.split(",")],
+    }
+    existing_iterations = load_state().get("agent3_iterations", [])
+    existing_iterations.append(agent3_entry)
 
     save_state({
-        "agent3_output": {
-            "preprocessed_file": str(dest),
-            "summary": summary,
-            "steps_completed": [s.strip() for s in steps_completed.split(",")],
-        },
+        "agent3_iterations": existing_iterations,
         "preprocessed_dataset_path": str(dest),
         "status": "agent3_done",
     })
+    save_state({"current_step": 0})
 
     return json.dumps({
         "status": "success",
@@ -1429,13 +1767,18 @@ def load_validation_context() -> str:
     preprocessing plan, Agent 3's output summary, and the preprocessed file path.
     """
     state = load_state()
+    agent1_output = state.get("agent1_output", [])
+    agent2_output = state.get("agent2_output", [])
+    agent3_iterations = state.get("agent3_iterations", [])
     context = {
         "user_goal": state.get("user_goal", ""),
-        "original_dataset": state.get("agent1_output", {}).get("selected_dataset", {}),
-        "preprocessing_plan": state.get("agent2_output", {}).get("preprocessing_plan", {}),
-        "agent3_output": state.get("agent3_output", {}),
+        "original_dataset": _latest(agent1_output).get("selected_dataset", {}),
+        "preprocessing_plan": _latest(agent2_output).get("preprocessing_plan", {}),
+        "agent3_latest_output": agent3_iterations[-1] if agent3_iterations else {},
+        "agent3_all_attempts": agent3_iterations,
         "preprocessed_path": state.get("preprocessed_dataset_path", ""),
         "iteration": state.get("loop_iteration", 0),
+        "previous_validations": state.get("agent4_iterations", []),
     }
     return json.dumps(context, indent=2, default=str)
 
@@ -1508,12 +1851,313 @@ def compare_before_after(
     return json.dumps(comparison, indent=2)
 
 
+async def run_plan_aware_validation(
+    original_path: str,
+    preprocessed_path: str,
+) -> str:
+    """
+    Upload both original and preprocessed datasets to the sandbox,
+    generate a plan-aware validation script from Agent 2's preprocessing plan,
+    run it, and return a structured checklist of pass/fail results per step.
+
+    This verifies that each planned transformation was actually applied correctly
+    by checking the actual numeric properties of the data (not Agent 3's self-report).
+
+    Args:
+        original_path: Absolute local path to the original raw dataset CSV.
+        preprocessed_path: Absolute local path to the final preprocessed CSV.
+
+    Returns:
+        JSON checklist with pass/fail per planned step plus sandbox step verifications.
+    """
+    state = load_state()
+    agent2_output = state.get("agent2_output", [])
+    plan = _latest(agent2_output).get("preprocessing_plan", {})
+    sandbox_log = state.get("agent3_sandbox_log", [])
+    iteration = state.get("loop_iteration", 0)
+
+    # With SafeExecute, modified_datasets/ IS /workspace — no upload needed
+    orig_sandbox = f"/workspace/{Path(original_path).name}"
+    pre_sandbox = f"/workspace/{Path(preprocessed_path).name}"
+
+    # Build the validation script from the plan
+    checks = []
+
+    # Always check: row count, column count, null count, duplicate count
+    checks.append("""
+results['shape_original'] = {'rows': len(orig), 'cols': len(orig.columns)}
+results['shape_preprocessed'] = {'rows': len(pre), 'cols': len(pre.columns)}
+results['nulls_original'] = int(orig.isnull().sum().sum())
+results['nulls_preprocessed'] = int(pre.isnull().sum().sum())
+results['dupes_original'] = int(orig.duplicated().sum())
+results['dupes_preprocessed'] = int(pre.duplicated().sum())
+""")
+
+    # duplicate_strategy
+    dup_strategy = plan.get("duplicate_strategy", "none")
+    if dup_strategy and dup_strategy.lower() not in ("none", "keep", ""):
+        checks.append(f"""
+# Check: duplicates were actually removed
+dup_check = {{}}
+dup_check['planned'] = '{dup_strategy}'
+dup_check['dupes_before'] = int(orig.duplicated().sum())
+dup_check['dupes_after'] = int(pre.duplicated().sum())
+dup_check['rows_removed'] = len(orig) - len(pre)
+dup_check['passed'] = pre.duplicated().sum() == 0
+results['check_drop_duplicates'] = dup_check
+""")
+
+    # missing_value_strategy
+    missing_strategy = plan.get("missing_value_strategy", "none")
+    if missing_strategy and missing_strategy.lower() not in ("none", ""):
+        checks.append(f"""
+# Check: missing values were reduced
+missing_check = {{}}
+missing_check['planned'] = '{missing_strategy}'
+missing_check['nulls_before'] = int(orig.isnull().sum().sum())
+missing_check['nulls_after'] = int(pre.isnull().sum().sum())
+missing_check['passed'] = pre.isnull().sum().sum() <= orig.isnull().sum().sum()
+results['check_handle_missing'] = missing_check
+""")
+
+    # columns_to_drop
+    cols_to_drop = plan.get("columns_to_drop", "none")
+    if cols_to_drop and cols_to_drop.lower() not in ("none", ""):
+        drop_cols = [c.strip().split(":")[0] for c in cols_to_drop.split(",") if c.strip() and c.strip().lower() != "none"]
+        if drop_cols:
+            checks.append(f"""
+# Check: specified columns were dropped
+drop_check = {{}}
+drop_check['planned_drops'] = {drop_cols}
+drop_check['still_present'] = [c for c in {drop_cols} if c in pre.columns]
+drop_check['passed'] = len(drop_check['still_present']) == 0
+results['check_drop_columns'] = drop_check
+""")
+
+    # scaling_strategy — parse "col:method,col:method" or "col:method"
+    scaling_strategy = plan.get("scaling_strategy", "none")
+    if scaling_strategy and scaling_strategy.lower() not in ("none", ""):
+        # Build per-column scaling checks
+        scale_checks_code = []
+        parts = [p.strip() for p in scaling_strategy.split(",") if p.strip()]
+        for part in parts:
+            tokens = part.split(":")
+            if len(tokens) < 2:
+                continue
+            col = tokens[0].strip()
+            method = tokens[1].strip().lower()
+            if col.lower() == "none" or method.lower() == "none":
+                continue
+            if method == "robust":
+                scale_checks_code.append(f"""
+if '{col}' in pre.columns:
+    median_val = float(pre['{col}'].median())
+    q75 = float(pre['{col}'].quantile(0.75))
+    q25 = float(pre['{col}'].quantile(0.25))
+    iqr_val = q75 - q25
+    results['check_scale_{col}_robust'] = {{
+        'planned': 'robust',
+        'median': round(median_val, 4),
+        'iqr': round(iqr_val, 4),
+        'passed': abs(median_val) < 0.5 and 0.5 < iqr_val < 2.0
+    }}
+""")
+            elif method == "standard":
+                scale_checks_code.append(f"""
+if '{col}' in pre.columns:
+    mean_val = float(pre['{col}'].mean())
+    std_val = float(pre['{col}'].std())
+    results['check_scale_{col}_standard'] = {{
+        'planned': 'standard',
+        'mean': round(mean_val, 4),
+        'std': round(std_val, 4),
+        'passed': abs(mean_val) < 0.1 and abs(std_val - 1.0) < 0.2
+    }}
+""")
+            elif method == "minmax":
+                scale_checks_code.append(f"""
+if '{col}' in pre.columns:
+    min_val = float(pre['{col}'].min())
+    max_val = float(pre['{col}'].max())
+    results['check_scale_{col}_minmax'] = {{
+        'planned': 'minmax',
+        'min': round(min_val, 4),
+        'max': round(max_val, 4),
+        'passed': min_val >= -0.01 and max_val <= 1.01
+    }}
+""")
+        if scale_checks_code:
+            checks.extend(scale_checks_code)
+
+    # encoding_strategy — parse "col:method,col:method"
+    encoding_strategy = plan.get("encoding_strategy", "none")
+    if encoding_strategy and encoding_strategy.lower() not in ("none", ""):
+        parts = [p.strip() for p in encoding_strategy.split(",") if p.strip()]
+        for part in parts:
+            tokens = part.split(":")
+            if len(tokens) < 2:
+                continue
+            col = tokens[0].strip()
+            method = tokens[1].strip().lower()
+            if col.lower() == "none" or method.lower() == "none":
+                continue
+            if method == "onehot":
+                checks.append(f"""
+enc_check = {{}}
+enc_check['planned'] = 'onehot'
+enc_check['col'] = '{col}'
+enc_check['original_col_gone'] = '{col}' not in pre.columns
+enc_check['dummy_cols_present'] = [c for c in pre.columns if c.startswith('{col}_')]
+enc_check['passed'] = '{col}' not in pre.columns and len(enc_check['dummy_cols_present']) > 0
+results['check_encode_{col}_onehot'] = enc_check
+""")
+            elif method in ("label", "binary"):
+                checks.append(f"""
+enc_check = {{}}
+enc_check['planned'] = '{method}'
+enc_check['col'] = '{col}'
+if '{col}' in pre.columns:
+    enc_check['dtype'] = str(pre['{col}'].dtype)
+    enc_check['passed'] = str(pre['{col}'].dtype) in ('int64', 'int32', 'float64', 'int8')
+else:
+    enc_check['passed'] = False
+    enc_check['reason'] = 'column not found'
+results['check_encode_{col}_{method}'] = enc_check
+""")
+
+    # outlier_strategy — parse "col:method,col:method"
+    outlier_strategy = plan.get("outlier_strategy", "none")
+    if outlier_strategy and outlier_strategy.lower() not in ("none", ""):
+        parts = [p.strip() for p in outlier_strategy.split(",") if p.strip()]
+        for part in parts:
+            tokens = part.split(":")
+            if len(tokens) < 2:
+                continue
+            col = tokens[0].strip()
+            method = tokens[1].strip().lower()
+            if col.lower() == "none" or method.lower() in ("none", "keep"):
+                continue
+            checks.append(f"""
+if '{col}' in orig.columns and '{col}' in pre.columns:
+    q1 = float(orig['{col}'].quantile(0.25))
+    q3 = float(orig['{col}'].quantile(0.75))
+    iqr = q3 - q1
+    expected_upper = q3 + 1.5 * iqr
+    expected_lower = q1 - 1.5 * iqr
+    actual_max = float(pre['{col}'].max())
+    actual_min = float(pre['{col}'].min())
+    results['check_outlier_{col}'] = {{
+        'planned': '{method}',
+        'original_max': round(float(orig['{col}'].max()), 4),
+        'preprocessed_max': round(actual_max, 4),
+        'expected_upper_bound': round(expected_upper, 4),
+        'passed': actual_max <= expected_upper * 1.05
+    }}
+""")
+
+    # feature_engineering
+    feat_engineering = plan.get("feature_engineering", "none")
+    if feat_engineering and feat_engineering.lower() not in ("none", ""):
+        checks.append(f"""
+feat_check = {{}}
+feat_check['planned'] = '{feat_engineering[:100]}'
+feat_check['cols_added'] = len(pre.columns) - len(orig.columns)
+feat_check['passed'] = len(pre.columns) > len(orig.columns)
+results['check_feature_engineering'] = feat_check
+""")
+
+    # datetime_processing
+    datetime_processing = plan.get("datetime_processing", "none")
+    if datetime_processing and datetime_processing.lower() not in ("none", ""):
+        checks.append(f"""
+dt_check = {{}}
+dt_check['planned'] = '{datetime_processing[:100]}'
+dt_check['cols_added'] = len(pre.columns) - len(orig.columns)
+dt_check['passed'] = len(pre.columns) > len(orig.columns)
+results['check_datetime_processing'] = dt_check
+""")
+
+    # Sandbox log checks — verify each custom sandbox step
+    current_iter_logs = [s for s in sandbox_log if s.get("iteration") == iteration]
+    for log_entry in current_iter_logs:
+        step_name = log_entry.get("step_name", "unknown")
+        purpose = log_entry.get("purpose", "")
+        stdout = log_entry.get("stdout", "")
+        checks.append(f"""
+sandbox_check_{step_name} = {{}}
+sandbox_check_{step_name}['step'] = '{step_name}'
+sandbox_check_{step_name}['purpose'] = '''{purpose[:100]}'''
+sandbox_check_{step_name}['stdout_preview'] = '''{stdout[:200]}'''
+sandbox_check_{step_name}['rows_after'] = len(pre)
+sandbox_check_{step_name}['passed'] = len(pre) > 0
+results['check_sandbox_{step_name}'] = sandbox_check_{step_name}
+""")
+
+    # Assemble the full script
+    checks_code = "\n".join(checks)
+    script = f"""
+import pandas as pd
+import numpy as np
+import json
+
+orig = pd.read_csv('{orig_sandbox}')
+pre = pd.read_csv('{pre_sandbox}')
+
+results = {{}}
+
+{checks_code}
+
+print(json.dumps(results, indent=2, default=str))
+"""
+
+    # Write and run via SafeExecute
+    await write_file_to_sandbox("validate.py", script)
+    raw = await run_in_sandbox("exec(open('/workspace/validate.py').read())")
+    try:
+        result = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return json.dumps({
+            "error": "run_in_sandbox returned unexpected output (not JSON)",
+            "raw": str(raw)[:500],
+        }, indent=2)
+    stdout = result.get("stdout", "")
+    stderr = result.get("stderr", "")
+
+    if not result.get("success") or not stdout.strip():
+        return json.dumps({
+            "error": "Validation script failed",
+            "stderr": stderr,
+            "script": script,
+        }, indent=2)
+
+    try:
+        checklist = json.loads(stdout)
+    except Exception:
+        return json.dumps({"error": "Could not parse validation output", "raw_stdout": stdout}, indent=2)
+
+    # Compute overall pass/fail summary
+    check_keys = [k for k in checklist if k.startswith("check_")]
+    passed = [k for k in check_keys if checklist[k].get("passed") is True]
+    failed = [k for k in check_keys if checklist[k].get("passed") is False]
+
+    return json.dumps({
+        "status": "ok",
+        "iteration": iteration,
+        "total_checks": len(check_keys),
+        "passed": len(passed),
+        "failed": len(failed),
+        "failed_checks": failed,
+        "checklist": checklist,
+    }, indent=2, default=str)
+
+
 def save_validation_result(
     verdict: str,
     issues_found: str,
     feedback_for_agent3: str,
     quality_score: str,
     validation_summary: str,
+    checklist_json: str = "{}",
 ) -> str:
     """
     Save the validation result to pipeline_state.json.
@@ -1526,22 +2170,41 @@ def save_validation_result(
         feedback_for_agent3: Specific instructions for Agent 3 to fix issues (empty if PASS).
         quality_score: A score from 1-10 rating the preprocessing quality.
         validation_summary: A paragraph summarizing the validation results.
+        checklist_json: JSON string of the plan-aware checklist from run_plan_aware_validation. Pass '{}' if not available.
 
     Returns:
         Confirmation message.
     """
+    if verdict.upper() not in ("PASS", "FAIL"):
+        return json.dumps({
+            "error": f"Invalid verdict '{verdict}'. Must be 'PASS' or 'FAIL'.",
+        }, indent=2)
+
+    try:
+        checklist = json.loads(checklist_json) if checklist_json and checklist_json.strip() else {}
+    except (json.JSONDecodeError, TypeError):
+        checklist = {}
+
     result = {
         "verdict": verdict.upper(),
         "issues_found": [i.strip() for i in issues_found.split(",") if i.strip()],
         "feedback_for_agent3": feedback_for_agent3,
         "quality_score": quality_score,
         "validation_summary": validation_summary,
+        "checklist": checklist,
     }
 
+    current_state = load_state()
+    iteration = current_state.get("loop_iteration", 0)
+    result["iteration"] = iteration
+
+    existing_iterations = current_state.get("agent4_iterations", [])
+    existing_iterations.append(result)
+
     state_update = {
-        "agent4_output": result,
+        "agent4_iterations": existing_iterations,
         "agent4_feedback": feedback_for_agent3 if verdict.upper() == "FAIL" else "",
-        "loop_iteration": load_state().get("loop_iteration", 0) + 1,
+        "loop_iteration": iteration + 1,
     }
 
     if verdict.upper() == "PASS":
@@ -1612,10 +2275,10 @@ def load_full_pipeline_context() -> str:
     context = {
         "user_goal": state.get("user_goal", ""),
         "qa_pairs": state.get("qa_pairs", []),
-        "agent1_output": state.get("agent1_output", {}),
-        "agent2_output": state.get("agent2_output", {}),
-        "agent3_output": state.get("agent3_output", {}),
-        "agent4_output": state.get("agent4_output", {}),
+        "agent1_output": _latest(state.get("agent1_output")),
+        "agent2_output": _latest(state.get("agent2_output")),
+        "agent3_iterations": state.get("agent3_iterations", []),
+        "agent4_iterations": state.get("agent4_iterations", []),
         "original_dataset_path": orig_path,
         "preprocessed_dataset_path": proc_path,
         "original_dataset_stats": orig_stats,
@@ -1638,11 +2301,23 @@ def save_preprocessing_report(report_content: str, report_filename: str) -> str:
     Returns:
         Confirmation with the output file path.
     """
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = OUTPUTS_DIR / report_filename
+    if not report_content or len(report_content) < 100:
+        return json.dumps({
+            "error": "report_content is empty or too short. Write the full report before calling this tool.",
+            "received_length": len(report_content) if report_content else 0,
+        }, indent=2)
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_content)
+    try:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = OUTPUTS_DIR / report_filename
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_content)
+    except OSError as e:
+        return json.dumps({
+            "error": f"Could not write preprocessing report: {e}",
+            "path": str(OUTPUTS_DIR / report_filename),
+            "fix": "Check write permissions on the outputs/ folder.",
+        }, indent=2)
 
     save_state({
         "report_path": str(report_path),
@@ -1664,7 +2339,7 @@ from google.adk.agents import Agent, SequentialAgent, LoopAgent, BaseAgent
 from google.adk.events import Event, EventActions
 from google.adk.agents.invocation_context import InvocationContext
 
-# OpenSandbox tools for secure code execution
+# SafeExecute tools for secure code execution
 from data_preprocessing_agent.sandbox_executor import (
     start_sandbox,
     stop_sandbox,
@@ -1758,7 +2433,7 @@ After saving, respond with a concise summary of your plan.
 preprocessing_executor_agent = Agent(
     model=MODEL,
     name="preprocessing_executor_agent",
-    description="Executes the preprocessing plan step by step using specialized tools and an OpenSandbox environment.",
+    description="Executes the preprocessing plan step by step using specialized tools and a SafeExecute sandbox environment.",
     output_key="agent3_result",
     instruction="""You are Agent 3: the Preprocessing Executor.
 
@@ -1775,7 +2450,7 @@ A) BUILT-IN TOOLS (run on the HOST machine, use LOCAL Windows paths)
      handle_outliers, parse_datetime_columns, engineer_features,
      process_text_columns, detect_and_fix_data_types,
      validate_dataset, save_preprocessed_output
-   - These read/write files in: """ + str(MODIFIED_DATASETS_DIR) + """
+   - These read/write files in: modified_datasets/<problem-slug>/ (a subfolder named after your project)
    - NEVER pass a /workspace/... path to these tools — it will crash
      with [Errno 2] No such file or directory.
 
@@ -1796,7 +2471,7 @@ DEFAULT WORKFLOW (use built-in tools — no sandbox needed)
 3. For each step in step_by_step_order, call the matching built-in tool.
    - Each built-in tool returns the LOCAL path of its output file.
    - Use that returned path as the input to the next tool.
-   - Intermediate files go in modified_datasets/ as step_N_<name>.csv
+   - Built-in tools automatically name their output files as step_N_<name>.csv — you do NOT specify output_path.
 4. After the last step, call save_preprocessed_output with the
    final LOCAL path. This finalizes Agent 3's work.
 
@@ -1812,13 +2487,22 @@ running a library not exposed as a built-in tool, etc.
 
 In that case, do this MINI-LOOP for that one step ONLY:
   1. start_sandbox
-  2. upload_dataset_to_sandbox(local_path)  → returns /workspace/data/<name>.csv
-  3. write_file_to_sandbox('/workspace/data/script.py', '<python code>')
-  4. run_in_sandbox('python3 /workspace/data/script.py')
-  5. download_from_sandbox('/workspace/output/<result>.csv',
-                           '<local path in modified_datasets/>')
-  6. stop_sandbox
-Then resume the built-in tool chain on the LOCAL downloaded file.
+     → CHECK THE RESULT. If it contains "error", the sandbox is unavailable
+       (Docker Desktop is likely not running). In that case:
+       - Skip all sandbox steps entirely.
+       - Use the closest built-in tool equivalent instead.
+       - Note "sandbox unavailable" in save_preprocessed_output.
+       - DO NOT crash the pipeline — continue with built-in tools.
+  2. write_file_to_sandbox('script.py', '<python code>')
+     → The file is already in /workspace inside the container — no upload needed.
+  3. run_in_sandbox("exec(open('/workspace/script.py').read())")
+     → CHECK the result's "success" field. If False:
+       - If error_type == "docker_not_running": sandbox went down — skip remaining sandbox steps.
+       - If error_type == "execution_error": fix your Python code and retry.
+  4. read_file_from_sandbox('<output_filename>.csv')
+     → Results written to /workspace by the script are immediately on disk.
+  5. stop_sandbox
+Then resume the built-in tool chain on the local file in modified_datasets/.
 
 ================================================================
 TOOL SELECTION GUIDE FOR PLAN STEPS
@@ -1847,6 +2531,19 @@ RULES:
 - Check each tool's return status before proceeding.
 - Keep track of row counts — never lose more than 20% without good reason.
 - If you started the sandbox, you MUST stop it before finishing.
+- After EVERY run_in_sandbox call, immediately call log_sandbox_step with the script you wrote and the stdout returned. Agent 4 needs this to verify your sandbox work.
+- NEVER choose your own output filenames. Built-in tools generate step_N_<name>.csv automatically.
+
+HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
+- Before executing any plan step, check if the referenced columns exist in the current dataset.
+  If a plan step references columns that are not present in the current CSV, SKIP that step entirely.
+  Record what was skipped in save_preprocessed_output. Move on to the next step immediately.
+- If engineer_features returns a result where all features have "status": "unsupported_operation",
+  that step is complete (no crash) — move on to the next step. Do NOT retry.
+- If scale_numeric_columns or encode_categorical_columns reports "column not found" or produces
+  no changes because all target columns are missing, that is OK — skip and continue.
+- The goal is to finish ALL steps (even if some are skipped), then call save_preprocessed_output.
+  A pipeline that completes with some skipped steps is far better than a stalled pipeline.
 """,
     tools=[
         get_preprocessing_context,
@@ -1862,8 +2559,9 @@ RULES:
         process_text_columns,
         detect_and_fix_data_types,
         validate_dataset,
+        log_sandbox_step,
         save_preprocessed_output,
-        # OpenSandbox tools
+        # SafeExecute tools
         start_sandbox,
         stop_sandbox,
         upload_dataset_to_sandbox,
@@ -1886,23 +2584,37 @@ validation_agent = Agent(
 Your job is to thoroughly validate the preprocessed dataset.
 
 WORKFLOW:
-1. Call load_validation_context to understand the plan and what Agent 3 did.
-2. Call validate_dataset with comprehensive checks on the preprocessed file.
-3. Call compare_before_after to see what changed between original and preprocessed.
-4. Make your verdict: PASS or FAIL.
-5. Call save_validation_result with your verdict and detailed feedback.
+1. Call load_validation_context to understand the plan, original path, and preprocessed path.
+2. Call start_sandbox.
+   → CHECK THE RESULT. If it contains "error":
+     - The sandbox (Docker) is unavailable. Note this.
+     - Skip steps 3–4 entirely.
+     - Set checklist_json = '{}' when calling save_validation_result.
+     - Proceed directly to step 5 (structural checks are still possible without Docker).
+3. Call run_plan_aware_validation(original_path, preprocessed_path).
+   → If the result contains "error": treat as if sandbox was unavailable (skip plan-aware checks).
+4. Call stop_sandbox.
+5. Call validate_dataset for structural checks (nulls, dupes, inf, dtypes).
+6. Call compare_before_after for shape/stat diff.
+7. Make your verdict based on available evidence:
+   - If plan-aware checklist is available: primary weight on it.
+   - If sandbox unavailable: base verdict ONLY on structural checks + compare_before_after.
+     Reduce quality score by 1 point and note "plan-aware validation skipped (Docker unavailable)".
+8. Call save_validation_result with your verdict, feedback, and the checklist_json from step 3
+   (or '{}' if sandbox was unavailable).
 
 VALIDATION CRITERIA:
-- No null values remain (unless the plan explicitly says to keep some)
+PRIMARY — Plan-aware checks (from run_plan_aware_validation checklist, if available):
+- Each planned step has a corresponding PASSED check in the checklist
+- If any check is FAILED, that is a specific issue for Agent 3 to fix
+- Use the checklist's evidence (actual numbers) in your feedback — not vague descriptions
+
+SECONDARY — Structural checks (from validate_dataset, always run):
+- No null values remain (unless the plan explicitly allows it)
 - No duplicate rows remain
 - No infinite values in numeric columns
-- Row count hasn't dropped by more than 20% (unless plan required aggressive filtering)
-- All expected columns from the plan exist
+- Row count hasn't dropped by more than 20%
 - Target column exists and has no nulls
-- Data types are appropriate for ML (mostly numeric after encoding)
-- Feature engineering produced meaningful features (no all-null or all-same columns)
-- Scaling was applied correctly (check mean/std shifts)
-- No data leakage (target-derived features shouldn't exist)
 
 PASS CONDITIONS:
 - All critical checks pass
@@ -1929,7 +2641,18 @@ RULES:
 - If this is iteration 3+, be more lenient on non-critical issues
 - Always provide a quality score with justification
 """,
-    tools=[load_validation_context, validate_dataset, compare_before_after, save_validation_result],
+    tools=[
+        load_validation_context,
+        # Plan-aware sandbox validation
+        start_sandbox,
+        stop_sandbox,
+        upload_dataset_to_sandbox,
+        run_plan_aware_validation,
+        # Structural checks
+        validate_dataset,
+        compare_before_after,
+        save_validation_result,
+    ],
 )
 
 
@@ -1941,9 +2664,17 @@ class LoopEscalationChecker(BaseAgent):
         self,
         ctx: InvocationContext,
     ) -> AsyncGenerator[Event, None]:
-        state = load_state()
-        verdict = state.get("agent4_output", {}).get("verdict", "")
-        iteration = state.get("loop_iteration", 0)
+        try:
+            state = load_state()
+            agent4_iterations = state.get("agent4_iterations", [])
+            verdict = agent4_iterations[-1].get("verdict", "") if agent4_iterations else ""
+            iteration = state.get("loop_iteration", 0)
+        except Exception as e:
+            # State is unreadable — stop the loop to avoid infinite retries on broken state
+            print(f"[LOOP] Could not read pipeline state: {e} — stopping loop.", flush=True)
+            save_state({"status": "preprocessing_complete_with_warnings", "loop_error": str(e)})
+            yield Event(author=self.name, actions=EventActions(escalate=True))
+            return
 
         should_stop = (verdict == "PASS") or (iteration >= 5)
 

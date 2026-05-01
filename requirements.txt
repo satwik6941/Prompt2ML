@@ -6,9 +6,7 @@ kagglehub
 datasets
 huggingface_hub
 tavily
-opensandbox
-opensandbox-server
-opensandbox-code-interpreter
+safeexecute
 python-dotenv
 docker==7.1.0
 urllib3<2

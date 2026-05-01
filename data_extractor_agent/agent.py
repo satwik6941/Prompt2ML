@@ -16,9 +16,16 @@ from dotenv import load_dotenv
 sys.path.append(str(Path(__file__).parent.parent))
 from pipeline_state import load_state, save_state
 
-load_dotenv()
+load_dotenv(Path(__file__).parent.parent / ".env")
+load_dotenv(Path(__file__).parent / ".env")
 
 sys.stdout.reconfigure(line_buffering=True)
+
+# kagglehub reads KAGGLE_API_TOKEN natively (bearer token format KGAT_...) — no rename needed.
+# HuggingFace libraries check HF_TOKEN; our .env stores it as HUGGING_FACE_TOKEN — bridge the gap.
+_hf_token = os.getenv("HUGGING_FACE_TOKEN", "")
+if _hf_token:
+    os.environ["HF_TOKEN"] = _hf_token
 
 from tavily import TavilyClient
 
@@ -183,10 +190,6 @@ def get_dataset_requirements() -> str:
 
 from google.adk.agents import Agent
 
-# MCP toolsets — commented out for now, uncomment when MCP servers are ready
-# sys.path.append(str(Path(__file__).parent.parent))
-# from mcp_servers.mcp_servers import tavily_mcp, hugging_face_mcp
-
 dataset_extractor_agent = Agent(
     model="gemini-3.1-flash-lite-preview",
     name="dataset_extractor_agent",
@@ -215,8 +218,6 @@ IMPORTANT:
         search_datasets,
         download_kaggle_dataset,
         download_huggingface_dataset,
-        # tavily_mcp,
-        # hugging_face_mcp,
     ],
 )
 

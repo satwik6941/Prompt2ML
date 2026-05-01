@@ -25,7 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "data_preprocessing_agent" / ".env")
 
-from pipeline_state import load_state, save_state
+from pipeline_state import load_state, save_state, reset_run_dir_cache
 
 
 # ============================================================
@@ -78,13 +78,37 @@ def save_requirement_report(
     Returns:
         Confirmation message.
     """
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = OUTPUTS_DIR / report_filename
+    # Guard: catch placeholder strings the LLM sometimes passes instead of the real report
+    placeholder_markers = ["(the full report", "(see above)", "(report above)", "(provided above)"]
+    if len(report_content) < 500 or any(m in report_content.lower() for m in placeholder_markers):
+        return json.dumps({
+            "error": "report_content appears to be a placeholder, not the actual report. "
+                     "You MUST pass the complete verbatim report text — every section, every word. "
+                     "Re-generate the report and call this tool again with the full text.",
+            "received_length": len(report_content),
+            "received_preview": report_content[:200],
+        }, indent=2)
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_content)
+    # Parse qa_pairs_json safely — LLM may pass malformed JSON
+    try:
+        qa_pairs = json.loads(qa_pairs_json)
+        if not isinstance(qa_pairs, list):
+            qa_pairs = []
+    except (json.JSONDecodeError, TypeError):
+        qa_pairs = []
 
-    qa_pairs = json.loads(qa_pairs_json)
+    # Write report to disk
+    try:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = OUTPUTS_DIR / report_filename
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_content)
+    except OSError as e:
+        return json.dumps({
+            "error": f"Could not write report file: {e}",
+            "path": str(OUTPUTS_DIR / report_filename),
+            "fix": "Check write permissions on the outputs/ folder.",
+        }, indent=2)
 
     save_state({
         "user_goal": user_goal,
@@ -93,6 +117,8 @@ def save_requirement_report(
         "report_filename": report_filename,
         "status": "report_ready",
     })
+    # Clear run-dir cache so downstream agents resolve the slug from the goal we just saved
+    reset_run_dir_cache()
 
     return json.dumps({
         "status": "success",
@@ -162,7 +188,10 @@ WORKFLOW:
 5. Call save_requirement_report with:
    - user_goal: the user's original first message
    - qa_pairs_json: all 7 Q&A pairs as JSON array
-   - report_content: the full report
+   - report_content: THE COMPLETE FULL TEXT OF THE REPORT YOU JUST WROTE — every word,
+     every section, verbatim. Do NOT pass a placeholder like "(see above)" or
+     "(the report provided above)" or a summary. The exact full string must be passed
+     or the file will not be saved correctly.
    - report_filename: a descriptive filename like '<project>_project_report.txt'
 
 6. Respond with a brief summary and tell the user the pipeline will now find and download datasets.
@@ -215,9 +244,11 @@ async def run_agent_turn(runner, user_id, session_id, user_text):
             return agent_response
         except Exception as e:
             error_msg = str(e)
-            if "500" in error_msg or "INTERNAL" in error_msg:
-                print(f"\n[WARN] Gemini server error (attempt {attempt + 1}/3). Retrying in 5s...", flush=True)
-                await asyncio.sleep(5)
+            if any(k in error_msg for k in ("500", "503", "INTERNAL", "UNAVAILABLE", "overloaded", "Resource has been exhausted")):
+                wait = 10 if "503" in error_msg or "UNAVAILABLE" in error_msg else 5
+                print(f"\n[WARN] Gemini transient error (attempt {attempt + 1}/3). Retrying in {wait}s...", flush=True)
+                print(f"[WARN] Error: {error_msg[:200]}", flush=True)
+                await asyncio.sleep(wait)
                 if attempt == 2:
                     print("\n[ERROR] Gemini API failed after 3 attempts.", flush=True)
                     return None
@@ -385,12 +416,28 @@ async def run_pipeline():
         )
         print("\n[PIPELINE] Preprocessing datasets...\n", flush=True)
 
-        response = await run_agent_turn(
-            phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message
-        )
+        response = None
+        for phase3_attempt in range(3):
+            if phase3_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 3 (attempt {phase3_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(15)
+                SESSION_PHASE3 = f"session_phase3_retry{phase3_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE3
+                )
+                phase3_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=data_preprocessing_agent,
+                    session_service=session_service,
+                )
+            response = await run_agent_turn(
+                phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message
+            )
+            if response is not None:
+                break
 
         if response is None:
-            print("\n[ERROR] Data preprocessing failed. Exiting.")
+            print("\n[ERROR] Data preprocessing failed after 3 attempts. Exiting.")
             return
 
         print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
