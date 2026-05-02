@@ -136,7 +136,7 @@ from google.adk.agents import Agent
 
 # Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
-from data_preprocessing_agent.agent import data_preprocessing_agent
+from data_preprocessing_agent.agent import data_preprocessing_agent, report_generator_agent
 
 # --- Phase 1: Requirement Gatherer ---
 requirement_gatherer_agent = Agent(
@@ -392,9 +392,10 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 3: Dataset Preprocessing")
     print("=" * 60)
 
+    _PHASE3_DONE_STATUSES = {"pipeline_complete", "preprocessing_complete", "preprocessing_complete_with_warnings"}
     state = load_state()
-    if state.get("status") == "pipeline_complete" and state.get("report_path"):
-        print(f"\n[PIPELINE] Datasets already preprocessed. Skipping Phase 3.")
+    if state.get("status") in _PHASE3_DONE_STATUSES and state.get("preprocessed_dataset_path"):
+        print(f"\n[PIPELINE] Datasets already preprocessed (status: {state.get('status')}). Skipping Phase 3.")
     else:
         SESSION_PHASE3 = "session_phase3"
         await session_service.create_session(
@@ -441,6 +442,70 @@ async def run_pipeline():
             return
 
         print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
+
+    # ==============================================================
+    # PHASE 4: Preprocessing Report Generation (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 4: Preprocessing Report")
+    print("=" * 60)
+
+    state = load_state()
+    if state.get("status") == "pipeline_complete" and state.get("report_path"):
+        print(f"\n[PIPELINE] Report already generated at: {state.get('report_path')}. Skipping Phase 4.")
+    else:
+        SESSION_PHASE4 = "session_phase4"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
+        )
+
+        phase4_runner = Runner(
+            app_name=APP_NAME,
+            agent=report_generator_agent,
+            session_service=session_service,
+        )
+
+        print("\n[PIPELINE] Generating preprocessing report...\n", flush=True)
+
+        response = None
+        for phase4_attempt in range(3):
+            if phase4_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 4 (attempt {phase4_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(10)
+                SESSION_PHASE4 = f"session_phase4_retry{phase4_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
+                )
+                phase4_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=report_generator_agent,
+                    session_service=session_service,
+                )
+            response = await run_agent_turn(
+                phase4_runner, USER_ID, SESSION_PHASE4,
+                "Generate the comprehensive preprocessing report for this ML project."
+            )
+            if response is not None:
+                break
+
+        if response is None:
+            print("\n[ERROR] Report generation failed after 3 attempts.")
+        else:
+            print("\n[PIPELINE] Phase 4 complete — preprocessing report saved!")
+
+    # ==============================================================
+    # FINAL STATUS
+    # ==============================================================
+
+    final_state = load_state()
+    print("\n" + "=" * 60)
+    print("  FINAL PIPELINE STATUS")
+    print("=" * 60)
+    print(f"  Status      : {final_state.get('status', 'unknown')}")
+    print(f"  Dataset     : {final_state.get('preprocessed_dataset_path', 'N/A')}")
+    print(f"  Report      : {final_state.get('report_path', 'N/A')}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

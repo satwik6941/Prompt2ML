@@ -2157,7 +2157,7 @@ def save_validation_result(
     feedback_for_agent3: str,
     quality_score: str,
     validation_summary: str,
-    checklist_json: str = "{}",
+    checklist_json: str,
 ) -> str:
     """
     Save the validation result to pipeline_state.json.
@@ -2676,10 +2676,17 @@ class LoopEscalationChecker(BaseAgent):
             yield Event(author=self.name, actions=EventActions(escalate=True))
             return
 
-        should_stop = (verdict == "PASS") or (iteration >= 5)
+        status = state.get("status", "")
+        # If Agent 4 never ran but Agent 3 already finished successfully,
+        # escalate so the pipeline can proceed to the report generator.
+        agent3_done_no_validation = (status in ("agent3_done", "preprocessing_complete")) and not agent4_iterations
+
+        should_stop = (verdict == "PASS") or (iteration >= 5) or agent3_done_no_validation
 
         if should_stop and verdict != "PASS":
-            save_state({"status": "preprocessing_complete_with_warnings"})
+            final_status = "preprocessing_complete" if agent3_done_no_validation else "preprocessing_complete_with_warnings"
+            save_state({"status": final_status})
+            print(f"[LOOP] Escalating — reason: verdict={verdict!r}, iteration={iteration}, agent3_done_no_validation={agent3_done_no_validation}", flush=True)
 
         yield Event(
             author=self.name,
