@@ -191,7 +191,7 @@ def get_dataset_requirements() -> str:
 from google.adk.agents import Agent
 
 dataset_extractor_agent = Agent(
-    model="gemini-3.1-flash-lite-preview",
+    model="gemini-3.1-flash-lite",
     name="dataset_extractor_agent",
     description="Searches Kaggle and HuggingFace for relevant datasets and downloads them.",
     instruction="""You are the Dataset Extractor Agent. Your task is to find and download the best datasets for the user's ML project.

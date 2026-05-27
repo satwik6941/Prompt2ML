@@ -12,6 +12,8 @@ import os
 import sys
 import json
 import asyncio
+import datetime
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from google.adk.sessions import InMemorySessionService
@@ -25,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "data_preprocessing_agent" / ".env")
 
-from pipeline_state import load_state, save_state, reset_run_dir_cache
+from pipeline_state import load_state, save_state, reset_run_dir_cache, backup_state, mark_checkpoint
 
 
 # ============================================================
@@ -34,6 +36,31 @@ from pipeline_state import load_state, save_state, reset_run_dir_cache
 
 MODEL = "gemini-3-flash-preview"
 OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+
+# Per-phase timeouts (seconds). Set to 0 to disable.
+PHASE2_TIMEOUT = 900   # 15 min — dataset search + download
+PHASE3_TIMEOUT = 1800  # 30 min — multi-agent preprocessing loop
+PHASE4_TIMEOUT = 600   # 10 min — report generation
+
+
+def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None:
+    """Write a JSON crash log to outputs/pipeline_error.json on any phase failure."""
+    log = {
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc(),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "context": context or {},
+    }
+    try:
+        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        crash_file = OUTPUTS_DIR / "pipeline_error.json"
+        with open(crash_file, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=4, default=str)
+        print(f"\n[PIPELINE] Crash log written to {crash_file}", flush=True)
+    except Exception:
+        pass  # never let crash logging itself crash the process
 
 
 # ============================================================
@@ -291,7 +318,8 @@ async def run_pipeline():
 
     # Check if Phase 1 already done
     state = load_state()
-    if state.get("status") == "report_ready" and state.get("user_goal"):
+    report_file_exists = bool(state.get("report_filename")) and (OUTPUTS_DIR / state.get("report_filename", "")).exists()
+    if state.get("status") == "report_ready" and state.get("user_goal") and report_file_exists:
         print(f"\n[PIPELINE] Report already exists for: {state['user_goal'][:80]}...")
         print("[PIPELINE] Skipping Phase 1, moving to Phase 2.\n")
     else:
@@ -327,9 +355,11 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 2: Dataset Extraction")
     print("=" * 60)
 
-    # Check if datasets already downloaded
+    # Check if datasets already downloaded (also verify files exist on disk)
     state = load_state()
-    if state.get("status") == "dataset_ready" and state.get("downloaded_dataset"):
+    ds = state.get("downloaded_dataset", {})
+    ds_path = ds.get("path", "") if isinstance(ds, dict) else ""
+    if state.get("status") == "dataset_ready" and ds_path and Path(ds_path).exists():
         print(f"\n[PIPELINE] Datasets already downloaded. Skipping Phase 2.")
     else:
         SESSION_PHASE2 = "session_phase2"
@@ -343,8 +373,6 @@ async def run_pipeline():
             session_service=session_service,
         )
 
-        # Feed the report to the extractor agent — it reads from pipeline_state
-        # but needs a user message to kick off
         state = load_state()
         kickoff_message = (
             f"Find and download relevant datasets for this ML project.\n"
@@ -354,14 +382,27 @@ async def run_pipeline():
 
         print("\n[PIPELINE] Searching and downloading datasets...\n", flush=True)
 
-        response = await run_agent_turn(
-            phase2_runner, USER_ID, SESSION_PHASE2, kickoff_message
-        )
+        try:
+            response = await asyncio.wait_for(
+                run_agent_turn(phase2_runner, USER_ID, SESSION_PHASE2, kickoff_message),
+                timeout=PHASE2_TIMEOUT if PHASE2_TIMEOUT > 0 else None,
+            )
+        except asyncio.TimeoutError as e:
+            _write_crash_log("Phase 2", e, {"timeout_seconds": PHASE2_TIMEOUT})
+            print(f"\n[ERROR] Phase 2 timed out after {PHASE2_TIMEOUT}s. Exiting.")
+            return
+        except Exception as e:
+            _write_crash_log("Phase 2", e)
+            print(f"\n[ERROR] Phase 2 unexpected error: {e}")
+            return
 
         if response is None:
+            _write_crash_log("Phase 2", RuntimeError("Agent returned None"), {})
             print("\n[ERROR] Dataset extractor failed. Exiting.")
             return
 
+        mark_checkpoint("phase2_complete")
+        backup_state()
         print("\n[PIPELINE] Phase 2 complete — datasets downloaded!")
 
     # ==============================================================
@@ -394,7 +435,8 @@ async def run_pipeline():
 
     _PHASE3_DONE_STATUSES = {"pipeline_complete", "preprocessing_complete", "preprocessing_complete_with_warnings"}
     state = load_state()
-    if state.get("status") in _PHASE3_DONE_STATUSES and state.get("preprocessed_dataset_path"):
+    preprocessed_path = state.get("preprocessed_dataset_path", "")
+    if state.get("status") in _PHASE3_DONE_STATUSES and preprocessed_path and Path(preprocessed_path).exists():
         print(f"\n[PIPELINE] Datasets already preprocessed (status: {state.get('status')}). Skipping Phase 3.")
     else:
         SESSION_PHASE3 = "session_phase3"
@@ -408,9 +450,6 @@ async def run_pipeline():
             session_service=session_service,
         )
 
-        # Feed the report to the preprocessing agent — it reads from pipeline_state
-        # but needs a user message to kick off
-        state = load_state()
         kickoff_message = (
             "Please do the data preprocessing steps for this ML project "
             "based on the user's goal, requirements, and downloaded datasets."
@@ -431,16 +470,34 @@ async def run_pipeline():
                     agent=data_preprocessing_agent,
                     session_service=session_service,
                 )
-            response = await run_agent_turn(
-                phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message
-            )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message),
+                    timeout=PHASE3_TIMEOUT if PHASE3_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 3 attempt {phase3_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE3_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 3 attempt {phase3_attempt + 1} timed out after {PHASE3_TIMEOUT}s.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 3 attempt {phase3_attempt + 1}", e)
+                print(f"\n[WARN] Phase 3 attempt {phase3_attempt + 1} error: {e}", flush=True)
+                response = None
+
             if response is not None:
                 break
 
         if response is None:
+            _write_crash_log("Phase 3", RuntimeError("All 3 attempts failed"), {})
             print("\n[ERROR] Data preprocessing failed after 3 attempts. Exiting.")
             return
 
+        mark_checkpoint("phase3_complete")
+        backup_state()
         print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
 
     # ==============================================================
@@ -452,8 +509,9 @@ async def run_pipeline():
     print("=" * 60)
 
     state = load_state()
-    if state.get("status") == "pipeline_complete" and state.get("report_path"):
-        print(f"\n[PIPELINE] Report already generated at: {state.get('report_path')}. Skipping Phase 4.")
+    report_path = state.get("report_path", "")
+    if state.get("status") == "pipeline_complete" and report_path and Path(report_path).exists():
+        print(f"\n[PIPELINE] Report already generated at: {report_path}. Skipping Phase 4.")
     else:
         SESSION_PHASE4 = "session_phase4"
         await session_service.create_session(
@@ -482,16 +540,36 @@ async def run_pipeline():
                     agent=report_generator_agent,
                     session_service=session_service,
                 )
-            response = await run_agent_turn(
-                phase4_runner, USER_ID, SESSION_PHASE4,
-                "Generate the comprehensive preprocessing report for this ML project."
-            )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(
+                        phase4_runner, USER_ID, SESSION_PHASE4,
+                        "Generate the comprehensive preprocessing report for this ML project.",
+                    ),
+                    timeout=PHASE4_TIMEOUT if PHASE4_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 4 attempt {phase4_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE4_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} timed out.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 4 attempt {phase4_attempt + 1}", e)
+                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} error: {e}", flush=True)
+                response = None
+
             if response is not None:
                 break
 
         if response is None:
+            _write_crash_log("Phase 4", RuntimeError("All 3 attempts failed"), {})
             print("\n[ERROR] Report generation failed after 3 attempts.")
         else:
+            mark_checkpoint("phase4_complete")
+            backup_state()
             print("\n[PIPELINE] Phase 4 complete — preprocessing report saved!")
 
     # ==============================================================

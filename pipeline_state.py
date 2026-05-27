@@ -132,3 +132,45 @@ def reset_run_dir_cache():
     """
     global _run_dir_cache
     _run_dir_cache = None
+
+
+# ── Checkpoint tracking ───────────────────────────────────────────────────────
+
+def mark_checkpoint(name: str) -> None:
+    """Record that a named pipeline step completed successfully with a UTC timestamp."""
+    import datetime
+    state = load_state()
+    checkpoints = state.get("pipeline_checkpoints", {})
+    checkpoints[name] = datetime.datetime.utcnow().isoformat()
+    save_state({"pipeline_checkpoints": checkpoints})
+    print(f"[PIPELINE] Checkpoint marked: {name}", flush=True)
+
+
+def is_checkpoint_done(name: str) -> bool:
+    """Return True if the named checkpoint was previously completed."""
+    return name in load_state().get("pipeline_checkpoints", {})
+
+
+def get_all_checkpoints() -> dict:
+    """Return all completed checkpoints and their timestamps."""
+    return load_state().get("pipeline_checkpoints", {})
+
+
+# ── State backup ──────────────────────────────────────────────────────────────
+
+def backup_state() -> bool:
+    """
+    Copy pipeline_state.json → pipeline_state.backup.json.
+    Called after each phase completes so there's always a last-good snapshot.
+    Returns True on success, False on failure (non-fatal).
+    """
+    if not STATE_FILE.exists():
+        return False
+    try:
+        backup = STATE_FILE.with_name("pipeline_state.backup.json")
+        shutil.copy2(STATE_FILE, backup)
+        print(f"[PIPELINE] State backed up to {backup}", flush=True)
+        return True
+    except Exception as e:
+        logger.warning("[PIPELINE] Could not backup state: %s", e)
+        return False

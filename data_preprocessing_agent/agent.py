@@ -1,4 +1,4 @@
-﻿"""
+"""
 Data Preprocessing Multi-Agent System (Google ADK)
 
 Architecture:
@@ -33,7 +33,7 @@ load_dotenv()
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3.1-flash-lite-preview"
+MODEL = "gemini-3.1-flash-lite"
 PROJECT_ROOT = Path(__file__).parent.parent
 DATASETS_DIR = PROJECT_ROOT / "datasets"
 MODIFIED_DATASETS_DIR = PROJECT_ROOT / "modified_datasets"   # base root — never written to directly
@@ -555,9 +555,11 @@ def _safe_write_csv(df, output_path: str) -> str | None:
     """
     Write a DataFrame to CSV with error handling.
     Returns None on success, or an error JSON string on failure.
+    Saves last_step_output_path to state on every successful write for crash recovery.
     """
     try:
         df.to_csv(output_path, index=False)
+        save_state({"last_step_output_path": output_path})
         return None
     except OSError as e:
         return json.dumps({
@@ -2351,6 +2353,47 @@ from data_preprocessing_agent.sandbox_executor import (
 )
 
 
+# ── Resume-state tool (shared by Agents 1, 2, 3) ─────────────────────────────
+
+def get_preprocessing_resume_state() -> str:
+    """
+    Check which sub-agents in the preprocessing pipeline have already completed
+    their work in a previous run. Call this FIRST before doing any expensive work
+    to avoid re-running steps that already succeeded.
+
+    Returns a JSON object with:
+      - agent1_done: True if Agent 1 already selected a dataset AND the file exists
+      - agent2_done: True if Agent 2 already saved a preprocessing plan
+      - agent3_has_partial_output: True if a step file from a crashed Agent 3 run exists
+      - preprocessing_complete: True if the full preprocessed dataset exists on disk
+      - last_step_output_path: path to the last successfully written step file (empty if none)
+      - current_step: how many preprocessing steps completed in the last run
+    """
+    state = load_state()
+
+    selected_path = state.get("selected_dataset_path", "")
+    preprocessed_path = state.get("preprocessed_dataset_path", "")
+    last_step_path = state.get("last_step_output_path", "")
+
+    selected_exists = bool(selected_path) and Path(selected_path).exists()
+    preprocessed_exists = bool(preprocessed_path) and Path(preprocessed_path).exists()
+    last_step_exists = bool(last_step_path) and Path(last_step_path).exists()
+
+    return json.dumps({
+        "agent1_done": bool(state.get("agent1_output")) and selected_exists,
+        "agent2_done": bool(state.get("agent2_output")),
+        "agent3_has_partial_output": last_step_exists,
+        "preprocessing_complete": preprocessed_exists,
+        "status": state.get("status", ""),
+        "selected_dataset_path": selected_path,
+        "selected_file_exists": selected_exists,
+        "preprocessed_dataset_path": preprocessed_path,
+        "last_step_output_path": last_step_path if last_step_exists else "",
+        "loop_iteration": state.get("loop_iteration", 0),
+        "current_step": state.get("current_step", 0),
+    }, indent=2)
+
+
 # --- Agent 1: Dataset Analyzer ---
 dataset_analyzer_agent = Agent(
     model=MODEL,
@@ -2359,12 +2402,20 @@ dataset_analyzer_agent = Agent(
     output_key="agent1_result",
     instruction="""You are Agent 1: the Dataset Analyzer & Selector.
 
-Your job is to:
-1. First, call get_project_context to understand the user's goal and project plan.
-2. Then, call scan_datasets_folder to discover and preview all available datasets.
+RESUME CHECK — do this FIRST, before anything else:
+1. Call get_preprocessing_resume_state().
+   - If agent1_done is True → your work already completed in a previous run.
+     Do NOT call scan_datasets_folder or save_selected_dataset again.
+     Respond: "Agent 1 already completed. Selected: <selected_dataset_path from resume state>"
+     Then STOP — do no further work.
+   - If agent1_done is False → proceed with the normal workflow below.
+
+NORMAL WORKFLOW (only if agent1_done is False):
+1. Call get_project_context to understand the user's goal and project plan.
+2. Call scan_datasets_folder to discover and preview all available datasets.
 3. Analyze EVERY dataset returned — look at columns, dtypes, row counts, missing values, and previews.
 4. Select the SINGLE BEST dataset file that is most relevant to the user's project goal.
-5. Finally, call save_selected_dataset with all the details of your selection.
+5. Call save_selected_dataset with all the details of your selection.
 
 SELECTION CRITERIA (in order of importance):
 - Relevance to the user's stated goal and project plan
@@ -2373,7 +2424,7 @@ SELECTION CRITERIA (in order of importance):
 - File format (prefer CSV/Parquet over JSON/Excel for ML pipelines)
 
 RULES:
-- You MUST call all three tools in order: get_project_context → scan_datasets_folder → save_selected_dataset
+- You MUST call all tools in order: get_project_context → scan_datasets_folder → save_selected_dataset
 - You MUST select exactly ONE file, not a folder
 - If multiple files exist in one folder (e.g. train.csv + test.csv), pick the main/largest one
 - Provide a detailed reason for your selection
@@ -2381,7 +2432,7 @@ RULES:
 
 After saving, respond with a brief summary of which dataset you selected and why.
 """,
-    tools=[get_project_context, scan_datasets_folder, save_selected_dataset],
+    tools=[get_preprocessing_resume_state, get_project_context, scan_datasets_folder, save_selected_dataset],
 )
 
 
@@ -2393,9 +2444,15 @@ preprocessing_strategist_agent = Agent(
     output_key="agent2_result",
     instruction="""You are Agent 2: the Preprocessing Strategist.
 
-Your job is to create a comprehensive, actionable preprocessing plan for the selected dataset.
+RESUME CHECK — do this FIRST, before anything else:
+1. Call get_preprocessing_resume_state().
+   - If agent2_done is True → your work already completed in a previous run.
+     Do NOT call load_dataset_profile or save_preprocessing_plan again.
+     Respond: "Agent 2 already completed. Preprocessing plan exists in pipeline state."
+     Then STOP — do no further work.
+   - If agent2_done is False → proceed with the normal workflow below.
 
-WORKFLOW:
+NORMAL WORKFLOW (only if agent2_done is False):
 1. Call get_user_requirements to understand what the user is building and what Agent 1 selected.
 2. Call load_dataset_profile to get deep statistics about the dataset.
 3. Analyze the profile carefully — look at missing values, dtypes, distributions, outliers, correlations, duplicates.
@@ -2418,14 +2475,14 @@ STEP ORDER (follow this standard order, skip steps that don't apply):
 9. feature_engineering → 10. scale_numerics → 11. final_validation
 
 RULES:
-- You MUST call all three tools in order
+- You MUST call all tools in order
 - Every column must be accounted for in the plan
 - The target column must NEVER be scaled or encoded (unless it's a label that needs encoding)
 - Be specific about WHY you chose each strategy
 
 After saving, respond with a concise summary of your plan.
 """,
-    tools=[get_user_requirements, load_dataset_profile, save_preprocessing_plan],
+    tools=[get_preprocessing_resume_state, get_user_requirements, load_dataset_profile, save_preprocessing_plan],
 )
 
 
@@ -2462,12 +2519,25 @@ B) SANDBOX TOOLS (run inside the Docker container, use /workspace/... paths)
    - The host filesystem is NOT visible inside the sandbox.
 
 ================================================================
+CRASH RECOVERY — check this BEFORE calling get_preprocessing_context
+================================================================
+1. Call get_preprocessing_resume_state() first.
+   - If preprocessing_complete is True → preprocessing is fully done from a previous run.
+     Call save_preprocessed_output with preprocessed_dataset_path to re-confirm, then STOP.
+   - If agent3_has_partial_output is True → a previous run saved partial progress.
+     Use last_step_output_path as the starting input to the NEXT step in the plan.
+     The current_step value tells you how many steps already completed.
+     Skip those steps and continue from there.
+   - If neither → no partial state; proceed with the full normal workflow below.
+
+================================================================
 DEFAULT WORKFLOW (use built-in tools — no sandbox needed)
 ================================================================
 1. Call get_preprocessing_context to load the plan, dataset path,
    AND any validation feedback from Agent 4 (for retries).
 2. The 'selected_dataset_path' from context is a LOCAL Windows path.
    Use it as the input to the FIRST built-in tool.
+   EXCEPTION: if crash recovery above found last_step_output_path, use THAT instead.
 3. For each step in step_by_step_order, call the matching built-in tool.
    - Each built-in tool returns the LOCAL path of its output file.
    - Use that returned path as the input to the next tool.
@@ -2546,6 +2616,7 @@ HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
   A pipeline that completes with some skipped steps is far better than a stalled pipeline.
 """,
     tools=[
+        get_preprocessing_resume_state,
         get_preprocessing_context,
         # Built-in preprocessing tools
         handle_missing_values,
