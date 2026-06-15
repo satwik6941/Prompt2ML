@@ -38,13 +38,15 @@ tavily_mcp = McpToolset(
     ),
 )
 
+COLAB_MCP_DIR = os.getenv("COLAB_MCP_DIR", "")  # set in .env — path to cloned colab-mcp repo
+
 colab_mcp = McpToolset(
     connection_params=StdioConnectionParams(
         server_params=StdioServerParameters(
             command="uv",
             args=["run", "colab-mcp"],
-            cwd="/path/to/github/colab-mcp",
+            cwd=COLAB_MCP_DIR or "/path/to/github/colab-mcp",
             timeout=30000
         )
     ),
-)           
+)

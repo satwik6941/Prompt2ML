@@ -10,6 +10,7 @@ from pathlib import Path
 
 STATE_FILE = Path(__file__).parent / "pipeline_state.json"
 MODIFIED_DATASETS_ROOT = Path(__file__).parent / "modified_datasets"
+OUTPUTS_ROOT = Path(__file__).parent / "outputs"
 
 logger = logging.getLogger(__name__)
 
@@ -87,25 +88,37 @@ def get(key: str, default=None):
 
 # ── Run-specific working directory ───────────────────────────────────────────
 
-def _slugify(text: str, max_len: int = 40) -> str:
-    """Convert a free-form problem statement into a filesystem-safe folder name."""
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9\s_-]", "", text)   # keep alphanum, space, dash, underscore
-    text = re.sub(r"\s+", "_", text)              # spaces → underscores
-    text = re.sub(r"_+", "_", text).strip("_")   # collapse repeated underscores
-    return text[:max_len] or "run"
+def _get_or_create_run_id() -> str:
+    """
+    Return the run_id for the current pipeline session.
+
+    On the first call for a fresh state, generates a timestamp-based ID
+    (``YYYYMMDD_HHMMSS``) and persists it so every agent in the same run
+    resolves the same ID.  Subsequent calls just read it from state.
+
+    This means folders look like:
+        modified_datasets/20240605_153042/
+        outputs/20240605_153042/
+    instead of the old prompt-derived slugs like
+        modified_datasets/i_want_to_build_a_ml_model_for_...
+    """
+    import datetime
+    state = load_state()
+    if "run_id" in state:
+        return state["run_id"]
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_state({"run_id": run_id})
+    return run_id
 
 
 def get_run_dir() -> Path:
     """
     Return the run-specific subdirectory inside modified_datasets/.
 
-        modified_datasets/<problem-slug>/
+        modified_datasets/<run_id>/
 
-    The slug is derived from user_goal in pipeline_state.json and cached for
-    the lifetime of the process so all agents in the same run share the same folder.
-
-    Falls back to modified_datasets/run/ if no goal is set yet.
+    The run_id is a timestamp (``YYYYMMDD_HHMMSS``) stored in pipeline_state.json
+    so all agents in the same pipeline run share the same folder.
 
     This function lives in pipeline_state.py (not agent.py) so both
     agent.py and sandbox_executor.py can import it without circular dependencies.
@@ -114,24 +127,54 @@ def get_run_dir() -> Path:
     if _run_dir_cache is not None:
         return _run_dir_cache
 
-    state = load_state()
-    goal = state.get("user_goal", "").strip()
-    slug = _slugify(goal) if goal else "run"
-    run_dir = MODIFIED_DATASETS_ROOT / slug
+    run_id = _get_or_create_run_id()
+    run_dir = MODIFIED_DATASETS_ROOT / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     _run_dir_cache = run_dir
     print(f"[PIPELINE] Run directory: {run_dir}", flush=True)
     return run_dir
 
 
+def get_outputs_dir() -> Path:
+    """
+    Return the run-specific outputs directory.
+
+        outputs/<run_id>/
+
+    All reports, model files, plots, and other pipeline outputs for this run
+    land here.  Keeps each run's files isolated so agents never accidentally
+    read files from a previous run.
+    """
+    run_id = _get_or_create_run_id()
+    out_dir = OUTPUTS_ROOT / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
 def reset_run_dir_cache():
     """
-    Clear the cached run directory so the next call to get_run_dir() re-reads
-    the goal from state. Call this after saving user_goal if agent.py and
-    pipeline_state.py are in the same process and the goal wasn't set at import time.
+    Clear the in-process run-dir cache so the next call to get_run_dir()
+    re-reads the run_id from state.  The persisted run_id in pipeline_state.json
+    is NOT cleared — use reset_run_id() for a truly fresh pipeline start.
     """
     global _run_dir_cache
     _run_dir_cache = None
+
+
+def reset_run_id() -> str:
+    """
+    Force-generate a brand-new run_id and clear the directory cache.
+    Call this at the very start of a fresh pipeline run (before saving user_goal)
+    so the new run gets its own isolated folders.
+    Returns the new run_id.
+    """
+    import datetime
+    global _run_dir_cache
+    _run_dir_cache = None
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_state({"run_id": run_id})
+    print(f"[PIPELINE] New run started: {run_id}", flush=True)
+    return run_id
 
 
 # ── Checkpoint tracking ───────────────────────────────────────────────────────

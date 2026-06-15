@@ -25,7 +25,7 @@ from typing import AsyncGenerator
 from dotenv import load_dotenv
 
 sys.path.append(str(Path(__file__).parent.parent))
-from pipeline_state import load_state, save_state, get_run_dir, reset_run_dir_cache
+from pipeline_state import load_state, save_state, get_run_dir, get_outputs_dir, reset_run_dir_cache
 
 load_dotenv()
 
@@ -2095,6 +2095,16 @@ sandbox_check_{step_name}['passed'] = len(pre) > 0
 results['check_sandbox_{step_name}'] = sandbox_check_{step_name}
 """)
 
+    # Ensure original dataset is visible inside the sandbox workspace.
+    # /workspace is modified_datasets/<slug>/, but original files live in datasets/.
+    # Copy the original file there if it isn't already present.
+    import shutil as _shutil
+    _orig_local = Path(original_path)
+    _workspace_dir = get_run_dir()
+    _workspace_orig = _workspace_dir / _orig_local.name
+    if _orig_local.exists() and not _workspace_orig.exists():
+        _shutil.copy2(str(_orig_local), str(_workspace_orig))
+
     # Assemble the full script
     checks_code = "\n".join(checks)
     script = f"""
@@ -2223,9 +2233,6 @@ def save_validation_result(
 # ===============  REPORT GENERATOR TOOLS  ===================
 # ============================================================
 
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
-
-
 def load_full_pipeline_context() -> str:
     """
     Load the ENTIRE pipeline state — every agent's output, every decision,
@@ -2309,15 +2316,15 @@ def save_preprocessing_report(report_content: str, report_filename: str) -> str:
             "received_length": len(report_content) if report_content else 0,
         }, indent=2)
 
+    outputs_dir = get_outputs_dir()
     try:
-        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-        report_path = OUTPUTS_DIR / report_filename
+        report_path = outputs_dir / report_filename
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_content)
     except OSError as e:
         return json.dumps({
             "error": f"Could not write preprocessing report: {e}",
-            "path": str(OUTPUTS_DIR / report_filename),
+            "path": str(outputs_dir / report_filename),
             "fix": "Check write permissions on the outputs/ folder.",
         }, indent=2)
 
@@ -2589,10 +2596,22 @@ TOOL SELECTION GUIDE FOR PLAN STEPS
 - scale_numerics → scale_numeric_columns tool
 - final_validation → validate_dataset tool
 
-RETRY HANDLING:
-- If agent4_feedback is not empty, focus ONLY on fixing those issues.
-- Re-run only the affected steps, starting from the previously
-  preprocessed local file (not from the original).
+================================================================
+RETRY HANDLING — CRITICAL (read carefully on every retry)
+================================================================
+If agent4_feedback is NOT empty, you are in a RETRY. Follow these
+rules STRICTLY — violations waste the whole pipeline:
+
+1. DO NOT re-run the full preprocessing pipeline from scratch.
+2. DO NOT re-run any step that already passed validation.
+3. Load the LAST preprocessed file from `preprocessed_dataset_path`
+   (from get_preprocessing_context) — that is your starting input.
+4. Run ONLY the specific tool(s) needed to fix the reported issues.
+   Example: if feedback says "column X still has nulls", call ONLY
+   handle_missing_values on the last preprocessed file.
+5. After fixing, call save_preprocessed_output with the new result.
+6. Do NOT call save_preprocessed_output with the old path again —
+   only call it after the targeted fix produces a new output file.
 
 RULES:
 - NEVER mix path types. Built-in tools = local paths only.
@@ -2698,9 +2717,13 @@ FAIL CONDITIONS:
 - Major deviation from the preprocessing plan
 
 When you FAIL:
-- Provide SPECIFIC, ACTIONABLE feedback for Agent 3
-- Say exactly which tool to use and with what parameters
-- Don't be vague — say "fill column X with median" not "fix missing values"
+- Provide SPECIFIC, ACTIONABLE feedback for Agent 3.
+- Say exactly which tool to call and with what parameters.
+- Do NOT say "redo preprocessing" or "rerun from scratch" — Agent 3
+  must fix ONLY the failing checks, starting from the last preprocessed file.
+- Be precise: "Call handle_missing_values on <last_preprocessed_path>
+  with strategy {{'Weekly_Sales': 'fill_median'}}" is good feedback.
+  "Fix missing values" is not.
 
 When you PASS:
 - Provide a quality summary the user can review

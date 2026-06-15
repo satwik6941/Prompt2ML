@@ -11,3 +11,8 @@ python-dotenv
 docker==7.1.0
 urllib3<2
 requests<2.32
+scikit-learn
+matplotlib
+seaborn
+pandas
+numpy

@@ -24,6 +24,7 @@ ERROR HANDLING:
     then note this in their output rather than crashing the pipeline.
 """
 
+import builtins
 import json
 import os
 import sys
@@ -43,6 +44,87 @@ _CONVERSATION_ID = "prompt2ml_pipeline"
 
 # Module-level flag so start/stop are idempotent
 _started = False
+
+# (import_name, pip_install_name) pairs — only packages that are lightweight
+# and expected to already be in the SafeExecute image. Heavy optional packages
+# (xgboost, lightgbm) are NOT listed here; SafeExecute auto-installs them on
+# first use so we don't block startup with a slow pip download.
+_REQUIRED_PACKAGES: list[tuple[str, str]] = [
+    ("numpy", "numpy"),
+    ("pandas", "pandas"),
+    ("sklearn", "scikit-learn"),
+    ("scipy", "scipy"),
+    ("matplotlib", "matplotlib"),
+    ("seaborn", "seaborn"),
+    ("plotly", "plotly"),
+    ("openpyxl", "openpyxl"),
+    ("xlrd", "xlrd"),
+    ("xlsxwriter", "XlsxWriter"),
+    ("statsmodels", "statsmodels"),
+    ("imblearn", "imbalanced-learn"),
+    ("joblib", "joblib"),
+]
+
+# PIP_TIMEOUT caps each pip install so a missing/slow package never blocks start_sandbox.
+_PIP_TIMEOUT = 60  # seconds per pip install call
+
+_DEPENDENCY_CHECK_SCRIPT = """\
+import subprocess, sys, json as _json
+
+required = {required}
+pip_timeout = {pip_timeout}
+
+missing = []
+for import_name, pip_name in required:
+    try:
+        __import__(import_name)
+    except ImportError:
+        missing.append(pip_name)
+
+if missing:
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "--no-warn-script-location"] + missing,
+            capture_output=True, text=True,
+            timeout=pip_timeout,
+        )
+        print(_json.dumps({{
+            "installed": missing,
+            "returncode": r.returncode,
+            "errors": r.stderr.strip()[-400:] if r.stderr.strip() else "",
+        }}))
+    except subprocess.TimeoutExpired:
+        print(_json.dumps({{
+            "installed": [],
+            "warning": f"pip timed out after {{pip_timeout}}s installing {{missing}}",
+        }}))
+else:
+    print(_json.dumps({{"installed": [], "note": "all dependencies already present"}}))
+"""
+
+# safeexecute writes temp.py and run_wrapper.sh with open(..., "w") which uses
+# \r\n on Windows. run_wrapper.sh then runs inside a Linux Docker container where
+# bash sees the \r and fails with "$'\r': command not found" and
+# "python: can't open file /workspace/temp.py\r". We fix this by temporarily
+# replacing builtins.open so all text-mode writes use LF-only endings.
+_original_open = builtins.open
+
+
+def _lf_open(file, mode='r', buffering=-1, encoding=None,
+             errors=None, newline=None, closefd=True, opener=None):
+    if 'w' in mode and 'b' not in mode:
+        newline = '\n'
+    return _original_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
+
+
+def _safeexecute_call(code: str) -> str:
+    """Call execute_python_code with builtins.open patched to force LF line endings."""
+    from safeexecute import execute_python_code
+    builtins.open = _lf_open
+    try:
+        return execute_python_code(code=code, working_directory=WORKSPACE)
+    finally:
+        builtins.open = _original_open
 
 
 def _ensure_workspace() -> str:
@@ -77,7 +159,7 @@ async def start_sandbox() -> str:
     WORKSPACE = _ensure_workspace()   # resolve run-dir now that user_goal is in state
 
     try:
-        from safeexecute import execute_python_code
+        from safeexecute import execute_python_code as _  # noqa: F401 — verify import only
     except ImportError:
         msg = "safeexecute package not installed. Run: pip install safeexecute"
         print(f"[SANDBOX ERROR] {msg}", flush=True)
@@ -89,14 +171,42 @@ async def start_sandbox() -> str:
 
     try:
         warmup_code = "import sys; print(f'Python {sys.version[:6]} ready')"
-        output = execute_python_code(code=warmup_code, working_directory=WORKSPACE)
+        output = _safeexecute_call(warmup_code)
         _started = True
         print(f"[SANDBOX] Started — workspace: {WORKSPACE}", flush=True)
         print(f"[SANDBOX] {output.strip()}", flush=True)
+
+        # --- dependency pre-flight -------------------------------------------
+        dep_script = _DEPENDENCY_CHECK_SCRIPT.format(
+            required=repr(_REQUIRED_PACKAGES),
+            pip_timeout=_PIP_TIMEOUT,
+        )
+        dep_raw = _safeexecute_call(dep_script).strip()
+        # Extract the last JSON line (pip may emit extra lines before ours)
+        dep_json: dict = {}
+        for line in reversed(dep_raw.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    dep_json = json.loads(line)
+                except json.JSONDecodeError:
+                    pass
+                break
+
+        installed = dep_json.get("installed", [])
+        if installed:
+            print(f"[SANDBOX] Installed missing deps: {installed}", flush=True)
+            if dep_json.get("returncode", 0) != 0:
+                print(f"[SANDBOX WARNING] pip errors: {dep_json.get('errors', '')}", flush=True)
+        else:
+            print(f"[SANDBOX] All dependencies present.", flush=True)
+        # ---------------------------------------------------------------------
+
         return json.dumps({
             "status": "sandbox_started",
             "workspace": WORKSPACE,
             "container_note": f"host {WORKSPACE} is mounted as /workspace inside the container",
+            "deps_installed": installed,
         })
     except Exception as e:
         if _is_docker_error(e):
@@ -148,6 +258,7 @@ async def stop_sandbox() -> str:
 
 
 async def run_in_sandbox(code: str) -> str:
+    code = code.replace('\r\n', '\n').replace('\r', '\n')  # prevent \r from corrupting filenames inside Linux container
     """
     Execute Python code inside the sandbox container.
 
@@ -179,8 +290,7 @@ async def run_in_sandbox(code: str) -> str:
         })
 
     try:
-        from safeexecute import execute_python_code
-        output = execute_python_code(code=code, working_directory=WORKSPACE)
+        output = _safeexecute_call(code)
         return json.dumps({
             "success": True,
             "stdout": output.strip(),
@@ -219,7 +329,7 @@ async def write_file_to_sandbox(filename: str, content: str) -> str:
     """
     workspace = Path(_ensure_workspace())
     dest = workspace / filename
-    dest.write_text(content, encoding="utf-8")
+    dest.write_text(content.replace('\r\n', '\n').replace('\r', '\n'), encoding="utf-8", newline='\n')
     print(f"[SANDBOX] Wrote script → {dest}", flush=True)
     return json.dumps({
         "status": "written",

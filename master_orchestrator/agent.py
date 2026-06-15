@@ -27,20 +27,20 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "data_preprocessing_agent" / ".env")
 
-from pipeline_state import load_state, save_state, reset_run_dir_cache, backup_state, mark_checkpoint
+from pipeline_state import load_state, save_state, reset_run_dir_cache, reset_run_id, get_outputs_dir, backup_state, mark_checkpoint
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3-flash-preview"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+MODEL = "gemini-3.1-flash-lite"
 
 # Per-phase timeouts (seconds). Set to 0 to disable.
 PHASE2_TIMEOUT = 900   # 15 min — dataset search + download
 PHASE3_TIMEOUT = 1800  # 30 min — multi-agent preprocessing loop
 PHASE4_TIMEOUT = 600   # 10 min — report generation
+PHASE5_TIMEOUT = 3600  # 60 min — ML strategy planning, model training, and final report
 
 
 def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None:
@@ -54,8 +54,7 @@ def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None
         "context": context or {},
     }
     try:
-        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-        crash_file = OUTPUTS_DIR / "pipeline_error.json"
+        crash_file = get_outputs_dir() / "pipeline_error.json"
         with open(crash_file, "w", encoding="utf-8") as f:
             json.dump(log, f, indent=4, default=str)
         print(f"\n[PIPELINE] Crash log written to {crash_file}", flush=True)
@@ -67,15 +66,30 @@ def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None
 # ========  PHASE 1: REQUIREMENT GATHERER TOOLS  =============
 # ============================================================
 
+_REQUIREMENTS_DONE_STATUSES = {
+    "report_ready", "dataset_ready", "preprocessing_complete",
+    "preprocessing_complete_with_warnings", "ml_plan_ready",
+    "model_trained", "ml_complete", "pipeline_complete",
+}
+
+
 def get_current_pipeline_status() -> str:
     """
     Check if the pipeline already has data from a previous run.
     Returns the current status and what data exists in pipeline_state.json.
     Use this FIRST to decide whether to skip requirement gathering.
+
+    If requirements_complete is true, skip ALL questions and just summarize.
     """
     state = load_state()
+    current_status = state.get("status", "empty")
     status = {
-        "status": state.get("status", "empty"),
+        "status": current_status,
+        "requirements_complete": (
+            current_status in _REQUIREMENTS_DONE_STATUSES
+            and bool(state.get("user_goal"))
+            and bool(state.get("report"))
+        ),
         "has_user_goal": bool(state.get("user_goal")),
         "has_report": bool(state.get("report")),
         "has_qa_pairs": bool(state.get("qa_pairs")),
@@ -125,15 +139,15 @@ def save_requirement_report(
         qa_pairs = []
 
     # Write report to disk
+    outputs_dir = get_outputs_dir()
     try:
-        OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-        report_path = OUTPUTS_DIR / report_filename
+        report_path = outputs_dir / report_filename
         with open(report_path, "w", encoding="utf-8") as f:
             f.write(report_content)
     except OSError as e:
         return json.dumps({
             "error": f"Could not write report file: {e}",
-            "path": str(OUTPUTS_DIR / report_filename),
+            "path": str(outputs_dir / report_filename),
             "fix": "Check write permissions on the outputs/ folder.",
         }, indent=2)
 
@@ -164,6 +178,8 @@ from google.adk.agents import Agent
 # Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
 from data_preprocessing_agent.agent import data_preprocessing_agent, report_generator_agent
+# Import Phase 5 ML pipeline (SequentialAgent: planner → trainer → report writer)
+from machine_learning_agent.agent import root_agent as ml_pipeline_agent
 
 # --- Phase 1: Requirement Gatherer ---
 requirement_gatherer_agent = Agent(
@@ -176,8 +192,10 @@ You have published groundbreaking research, delivered keynotes at NeurIPS, ICML,
 
 WORKFLOW:
 1. FIRST, call get_current_pipeline_status to check if requirements already exist.
-   - If status is 'report_ready' or later AND has_user_goal is true → SKIP to step 5 (just summarize existing data).
-   - If status is 'empty' or no user goal → proceed with step 2.
+   - If requirements_complete is true → STOP immediately. Output a one-paragraph summary of
+     the existing goal and report, then say "Pipeline will now proceed to the next phase."
+     Do NOT ask any questions. Do NOT generate a new report.
+   - If requirements_complete is false → proceed with step 2.
 
 2. The user's FIRST message to you is their project goal. Acknowledge it.
 
@@ -316,10 +334,16 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 1: Requirement Gathering")
     print("=" * 60)
 
+    # Statuses that mean Phase 1 is already complete (any status after report_ready counts)
+    _PHASE1_DONE_STATUSES = {
+        "report_ready", "dataset_ready", "preprocessing_complete",
+        "preprocessing_complete_with_warnings", "ml_plan_ready",
+        "model_trained", "ml_complete", "pipeline_complete",
+    }
+
     # Check if Phase 1 already done
     state = load_state()
-    report_file_exists = bool(state.get("report_filename")) and (OUTPUTS_DIR / state.get("report_filename", "")).exists()
-    if state.get("status") == "report_ready" and state.get("user_goal") and report_file_exists:
+    if state.get("status") in _PHASE1_DONE_STATUSES and state.get("user_goal") and state.get("report"):
         print(f"\n[PIPELINE] Report already exists for: {state['user_goal'][:80]}...")
         print("[PIPELINE] Skipping Phase 1, moving to Phase 2.\n")
     else:
@@ -336,8 +360,8 @@ async def run_pipeline():
                 print("\n[ERROR] Agent failed to respond. Exiting.")
                 return
 
-            # Check if report was saved
-            if load_state().get("status") == "report_ready":
+            # Check if report was saved (accept any post-Phase-1 status)
+            if load_state().get("status") in _PHASE1_DONE_STATUSES:
                 print("\n[PIPELINE] Phase 1 complete — report saved!")
                 break
 
@@ -573,6 +597,82 @@ async def run_pipeline():
             print("\n[PIPELINE] Phase 4 complete — preprocessing report saved!")
 
     # ==============================================================
+    # PHASE 5: Machine Learning (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 5: Machine Learning")
+    print("=" * 60)
+
+    state = load_state()
+    final_report_path = state.get("final_report_path", "")
+    if final_report_path and Path(final_report_path).exists():
+        print(f"\n[PIPELINE] ML pipeline already complete. Skipping Phase 5.")
+        print(f"  Final report: {final_report_path}")
+    else:
+        SESSION_PHASE5 = "session_phase5"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE5
+        )
+
+        phase5_runner = Runner(
+            app_name=APP_NAME,
+            agent=ml_pipeline_agent,
+            session_service=session_service,
+        )
+
+        state = load_state()
+        user_goal = state.get("user_goal", "Train the best ML model for the available dataset.")
+        kickoff_message = (
+            f"Run the complete ML pipeline for this project: {user_goal}\n\n"
+            "Execute all three phases: planning, training, and reporting."
+        )
+        print("\n[PIPELINE] Running ML pipeline (strategy → training → report)...\n", flush=True)
+
+        response = None
+        for phase5_attempt in range(3):
+            if phase5_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 5 (attempt {phase5_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(15)
+                SESSION_PHASE5 = f"session_phase5_retry{phase5_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE5
+                )
+                phase5_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=ml_pipeline_agent,
+                    session_service=session_service,
+                )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(phase5_runner, USER_ID, SESSION_PHASE5, kickoff_message),
+                    timeout=PHASE5_TIMEOUT if PHASE5_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 5 attempt {phase5_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE5_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 5 attempt {phase5_attempt + 1} timed out after {PHASE5_TIMEOUT}s.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 5 attempt {phase5_attempt + 1}", e)
+                print(f"\n[WARN] Phase 5 attempt {phase5_attempt + 1} error: {e}", flush=True)
+                response = None
+
+            if response is not None:
+                break
+
+        if response is None:
+            _write_crash_log("Phase 5", RuntimeError("All 3 attempts failed"), {})
+            print("\n[ERROR] ML pipeline failed after 3 attempts.")
+        else:
+            mark_checkpoint("phase5_complete")
+            backup_state()
+            print("\n[PIPELINE] Phase 5 complete — ML pipeline finished!")
+
+    # ==============================================================
     # FINAL STATUS
     # ==============================================================
 
@@ -580,9 +680,11 @@ async def run_pipeline():
     print("\n" + "=" * 60)
     print("  FINAL PIPELINE STATUS")
     print("=" * 60)
-    print(f"  Status      : {final_state.get('status', 'unknown')}")
-    print(f"  Dataset     : {final_state.get('preprocessed_dataset_path', 'N/A')}")
-    print(f"  Report      : {final_state.get('report_path', 'N/A')}")
+    print(f"  Status           : {final_state.get('status', 'unknown')}")
+    print(f"  Preprocessed     : {final_state.get('preprocessed_dataset_path', 'N/A')}")
+    print(f"  Preprocessing Rpt: {final_state.get('report_path', 'N/A')}")
+    print(f"  Best Model       : {final_state.get('best_model_path', 'N/A')}")
+    print(f"  Final ML Report  : {final_state.get('final_report_path', 'N/A')}")
     print("=" * 60)
 
 
