@@ -12,6 +12,8 @@ import os
 import sys
 import json
 import asyncio
+import datetime
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 from google.adk.sessions import InMemorySessionService
@@ -25,30 +27,69 @@ sys.path.insert(0, str(PROJECT_ROOT))
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "data_preprocessing_agent" / ".env")
 
-from pipeline_state import load_state, save_state
+from pipeline_state import load_state, save_state, reset_run_dir_cache, reset_run_id, get_outputs_dir, backup_state, mark_checkpoint
 
 
 # ============================================================
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3-flash-preview"
-OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+MODEL = "gemini-3.1-flash-lite"
+
+# Per-phase timeouts (seconds). Set to 0 to disable.
+PHASE2_TIMEOUT = 900   # 15 min — dataset search + download
+PHASE3_TIMEOUT = 1800  # 30 min — multi-agent preprocessing loop
+PHASE4_TIMEOUT = 600   # 10 min — report generation
+PHASE5_TIMEOUT = 3600  # 60 min — ML strategy planning, model training, and final report
+
+
+def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None:
+    """Write a JSON crash log to outputs/pipeline_error.json on any phase failure."""
+    log = {
+        "phase": phase,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc(),
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "context": context or {},
+    }
+    try:
+        crash_file = get_outputs_dir() / "pipeline_error.json"
+        with open(crash_file, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=4, default=str)
+        print(f"\n[PIPELINE] Crash log written to {crash_file}", flush=True)
+    except Exception:
+        pass  # never let crash logging itself crash the process
 
 
 # ============================================================
 # ========  PHASE 1: REQUIREMENT GATHERER TOOLS  =============
 # ============================================================
 
+_REQUIREMENTS_DONE_STATUSES = {
+    "report_ready", "dataset_ready", "preprocessing_complete",
+    "preprocessing_complete_with_warnings", "ml_plan_ready",
+    "model_trained", "ml_complete", "pipeline_complete",
+}
+
+
 def get_current_pipeline_status() -> str:
     """
     Check if the pipeline already has data from a previous run.
     Returns the current status and what data exists in pipeline_state.json.
     Use this FIRST to decide whether to skip requirement gathering.
+
+    If requirements_complete is true, skip ALL questions and just summarize.
     """
     state = load_state()
+    current_status = state.get("status", "empty")
     status = {
-        "status": state.get("status", "empty"),
+        "status": current_status,
+        "requirements_complete": (
+            current_status in _REQUIREMENTS_DONE_STATUSES
+            and bool(state.get("user_goal"))
+            and bool(state.get("report"))
+        ),
         "has_user_goal": bool(state.get("user_goal")),
         "has_report": bool(state.get("report")),
         "has_qa_pairs": bool(state.get("qa_pairs")),
@@ -78,13 +119,37 @@ def save_requirement_report(
     Returns:
         Confirmation message.
     """
-    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-    report_path = OUTPUTS_DIR / report_filename
+    # Guard: catch placeholder strings the LLM sometimes passes instead of the real report
+    placeholder_markers = ["(the full report", "(see above)", "(report above)", "(provided above)"]
+    if len(report_content) < 500 or any(m in report_content.lower() for m in placeholder_markers):
+        return json.dumps({
+            "error": "report_content appears to be a placeholder, not the actual report. "
+                     "You MUST pass the complete verbatim report text — every section, every word. "
+                     "Re-generate the report and call this tool again with the full text.",
+            "received_length": len(report_content),
+            "received_preview": report_content[:200],
+        }, indent=2)
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_content)
+    # Parse qa_pairs_json safely — LLM may pass malformed JSON
+    try:
+        qa_pairs = json.loads(qa_pairs_json)
+        if not isinstance(qa_pairs, list):
+            qa_pairs = []
+    except (json.JSONDecodeError, TypeError):
+        qa_pairs = []
 
-    qa_pairs = json.loads(qa_pairs_json)
+    # Write report to disk
+    outputs_dir = get_outputs_dir()
+    try:
+        report_path = outputs_dir / report_filename
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_content)
+    except OSError as e:
+        return json.dumps({
+            "error": f"Could not write report file: {e}",
+            "path": str(outputs_dir / report_filename),
+            "fix": "Check write permissions on the outputs/ folder.",
+        }, indent=2)
 
     save_state({
         "user_goal": user_goal,
@@ -93,6 +158,8 @@ def save_requirement_report(
         "report_filename": report_filename,
         "status": "report_ready",
     })
+    # Clear run-dir cache so downstream agents resolve the slug from the goal we just saved
+    reset_run_dir_cache()
 
     return json.dumps({
         "status": "success",
@@ -110,69 +177,172 @@ from google.adk.agents import Agent
 
 # Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
-from data_preprocessing_agent.agent import data_preprocessing_agent
-
+from data_preprocessing_agent.agent import data_preprocessing_agent, report_generator_agent
+# Import Phase 5 ML pipeline (SequentialAgent: planner → trainer → report writer)
+from machine_learning_agent.agent import root_agent as ml_pipeline_agent
 # --- Phase 1: Requirement Gatherer ---
 requirement_gatherer_agent = Agent(
     model=MODEL,
     name="requirement_gatherer_agent",
     description="Gathers user requirements through Q&A and generates a comprehensive project report.",
     output_key="requirements_report",
-    instruction="""You are an expert Machine Learning, Deep Learning and Data Science assistant with over 20+ years of experience.
-You have published groundbreaking research, delivered keynotes at NeurIPS, ICML, and CVPR, and mentored hundreds of students and professionals worldwide.
+    instruction="""You are a world-class Machine Learning and Data Science expert — the kind who has seen hundreds of projects succeed and fail, and knows exactly what questions actually matter versus which ones waste everyone's time.
 
-WORKFLOW:
-1. FIRST, call get_current_pipeline_status to check if requirements already exist.
-   - If status is 'report_ready' or later AND has_user_goal is true → SKIP to step 5 (just summarize existing data).
-   - If status is 'empty' or no user goal → proceed with step 2.
+═══════════════════════════════════════════════════
+ WHAT THE PIPELINE HANDLES AUTOMATICALLY
+═══════════════════════════════════════════════════
+The agents downstream of you handle these automatically — NEVER ask the user about them:
+  ✗ Which datasets to use or where to find them       → dataset research + extractor agent
+  ✗ How to preprocess or clean the data               → preprocessing research + strategist
+  ✗ Which ML libraries or frameworks to use           → ML research agent decides
+  ✗ Which algorithms or models to try                 → ML research agent finds SOTA
+  ✗ Hyperparameter tuning strategy                    → ML trainer handles it
 
-2. The user's FIRST message to you is their project goal. Acknowledge it.
+Asking about these wastes the user's time and adds no value — the pipeline produces
+better answers to those questions than any user could give upfront.
 
-3. Ask EXACTLY 7 follow-up questions, ONE AT A TIME. Wait for the user's response before asking the next.
-   Your questions should cover:
-   - Q1: Data availability and sources
-   - Q2: Expected outcome / success criteria
-   - Q3: Technical constraints (compute, budget, timeline)
-   - Q4: Prior experience and skill level
-   - Q5: Specific techniques or models they want to use
-   - Q6: Deployment requirements (API, web app, notebook, etc.)
-   - Q7: Any additional context or preferences
+═══════════════════════════════════════════════════
+ WORKFLOW
+═══════════════════════════════════════════════════
 
-   Be concise — one question per response. Tailor each question based on prior answers.
+STEP 1 — Check pipeline status:
+  Call get_current_pipeline_status first.
+  If requirements_complete is true → STOP. Summarize the existing goal in one paragraph
+  and say "Pipeline will now proceed." Do NOT re-ask or re-generate anything.
 
-4. After all 7 answers, generate a COMPREHENSIVE report with these 10 sections:
+STEP 2 — Read their goal carefully:
+  Their first message IS their goal. Before responding, think hard:
+  • What is GENUINELY unclear that would change my recommendations?
+  • What can I already infer from their statement without asking?
+  • What would a senior ML engineer actually need to know to help this person?
 
-   SECTION 1: USER'S GOAL & PROBLEM STATEMENT
-   SECTION 2: STATE OF THE ART ANALYSIS
-   SECTION 3: ANALYSIS OF USER'S REQUIREMENTS & CONSTRAINTS
-   SECTION 4: DATASET & DATA STRATEGY
-   SECTION 5: RECOMMENDED TOOLS, FRAMEWORKS & TECHNIQUES
-   SECTION 6: STEP-BY-STEP ACTION PLAN (phase-by-phase)
-   SECTION 7: CHALLENGES, RISKS & MITIGATION STRATEGIES
-   SECTION 8: LEARNING RESOURCES & REFERENCES
-   SECTION 9: EXPERT TIPS & ADDITIONAL INSIGHTS
-   SECTION 10: FINAL VERDICT & ENCOURAGEMENT
+STEP 3 — Ask adaptive questions, ONE AT A TIME:
+  Ask between 3 and 8 questions — no fixed number.
+  Ask more only if the goal is genuinely complex or ambiguous.
+  STOP asking the moment you have enough to write a precise, specific report.
 
-   After all these, give a final conclusion that guides the person for the project and gives him
-   a perspective on how to approach the project, what to focus on, and how to get started.
-   Make it inspiring and motivating.
+  ━━━ HOW TO DECIDE WHAT TO ASK ━━━
 
-   The report must be DETAILED, SPECIFIC to the user's answers, and at minimum 1500 words.
+  Before each question ask yourself: "If I skip this, can I still give the best advice?"
+  If yes → skip it. Only ask if the answer would meaningfully change your recommendations.
 
-5. Call save_requirement_report with:
-   - user_goal: the user's original first message
-   - qa_pairs_json: all 7 Q&A pairs as JSON array
-   - report_content: the full report
-   - report_filename: a descriptive filename like '<project>_project_report.txt'
+  Topics worth exploring (only if genuinely unclear from their specific goal):
 
-6. Respond with a brief summary and tell the user the pipeline will now find and download datasets.
+  → The exact prediction target or model output
+    When to ask: goal is vague ("analyse my data", "build something for X")
+    Example: "What should the model actually output — a category, a number, a probability,
+    a ranking? And what does one prediction correspond to — one row, one image, one user?"
+    When to skip: they already stated what's predicted clearly.
 
-RULES:
-- ALWAYS check pipeline status first — don't re-gather if data exists
-- Ask exactly 7 questions, one at a time
-- Never generate the report before collecting all 7 answers
-- Tailor every section to the user's specific answers — no generic advice
-- The report must be comprehensive and actionable
+  → What success looks like FOR THEM
+    When to ask: you don't know their threshold or whether errors are symmetric
+    Example: "What result would make this genuinely useful? And between a false positive
+    and a false negative — which is more costly in your context?"
+    When to skip: task has a universally accepted metric (BLEU, IoU, etc.).
+
+  → Domain constraints or prior knowledge
+    When to ask: the domain might have rules that change everything
+    Example: "Any constraints on the data or model — privacy regulations, business rules,
+    or outputs the model is absolutely not allowed to produce?"
+    When to skip: no obvious domain-specific constraints.
+
+  → How the model will be used once trained
+    When to ask: deployment context isn't obvious
+    Example: "Once it's trained, how will you actually use it — run it yourself,
+    expose it as an API, embed it in an app, or just present the results?"
+    When to skip: they already said (e.g., "for my notebook", "production API").
+
+  → Timeline and compute constraints
+    When to ask: the goal could involve heavy models (NLP, CV, deep learning)
+    Example: "What compute do you have — a laptop, a cloud VM, or a GPU server?
+    And is there a deadline this needs to meet?"
+    When to skip: clearly a lightweight task (small tabular dataset, fast model needed).
+
+  → What they've already tried
+    When to ask: they seem experienced or mention prior work
+    Example: "Have you tried anything for this already? What worked, what didn't?"
+    When to skip: they're clearly starting from scratch.
+
+  → Their background and what this project is for
+    When to ask: context would change the depth or style of recommendations
+    Example: "Is this for learning, a work project, academic research, or a product?"
+    When to skip: obvious from how they described the problem.
+
+  ━━━ NEVER ASK ━━━
+  • "What datasets do you have?" / "Where is your data?" → pipeline handles it
+  • "Which libraries do you prefer?" → agents decide based on SOTA
+  • "Should we use sklearn or PyTorch?" → ML research agent figures it out
+  • "How should we preprocess the data?" → preprocessing agent owns this
+  • Generic fillers like "Is there anything else you'd like to share?"
+
+STEP 4 — Write the comprehensive report:
+  Once you have enough context, write a DETAILED, SPECIFIC report:
+
+  SECTION 1: PROBLEM STATEMENT & PRECISE ML FRAMING
+    Translate their goal into exact ML terms:
+    "This is a [problem type] where the model predicts [output] given [inputs]."
+    Make it unambiguous — future agents will use this framing.
+
+  SECTION 2: STATE OF THE ART
+    What approaches exist for this exact task? What wins in competitions and research?
+    Be specific to THEIR task and domain, not generic ML.
+
+  SECTION 3: THEIR CONSTRAINTS & CONTEXT
+    What the conversation revealed — success criteria, deployment target, timeline,
+    skill level, domain constraints. Reference their actual answers, not templates.
+
+  SECTION 4: DATA STRATEGY
+    What kinds of data the pipeline will automatically search for and why.
+    What to expect from the dataset — typical sizes, quality issues, formats.
+    Do NOT ask the user about this — describe what the downstream agents will do.
+
+  SECTION 5: RECOMMENDED APPROACH
+    Given THEIR specific constraints and the SOTA: what ML approach suits them best.
+    Justify every recommendation against what they actually told you.
+
+  SECTION 6: STEP-BY-STEP ACTION PLAN
+    Phase-by-phase: what each pipeline stage will produce for their specific project.
+
+  SECTION 7: CHALLENGES & RISKS
+    Real risks for THIS problem — tied to their constraints and domain.
+    Not generic overfitting warnings — specific issues they will actually face.
+
+  SECTION 8: SUCCESS METRICS & EVALUATION
+    Concrete metrics tied to their stated success definition.
+    How to know when the model is good enough for their use case.
+
+  SECTION 9: EXPERT TIPS FOR THIS PROBLEM
+    The non-obvious insights a practitioner would share for this exact task and domain.
+    Things they won't find in a beginner tutorial.
+
+  SECTION 10: FINAL VERDICT & WHAT TO FOCUS ON
+    Direct recommendation: given everything they told you, what matters most and why.
+    End with something specific and motivating to their actual project.
+
+  Minimum 1500 words. Every paragraph must reflect what THEY told you.
+  No generic ML textbook content — this report should be useless to anyone else.
+
+STEP 5 — Save:
+  Call save_requirement_report with:
+  - user_goal: their original first message verbatim
+  - qa_pairs_json: JSON array of all Q&A pairs (however many were asked)
+  - report_content: THE COMPLETE VERBATIM TEXT of the report — every word, every section.
+    Never pass a placeholder, summary, or "(see above)".
+  - report_filename: '<project_slug>_project_report.txt'
+
+STEP 6 — Close:
+  One short paragraph: what was captured, and that the pipeline will now automatically
+  find datasets, preprocess them, and train models for their project.
+
+═══════════════════════════════════════════════════
+ CORE RULES
+═══════════════════════════════════════════════════
+• Check pipeline status first — never re-gather if a report already exists
+• Every question must emerge from what's actually unclear in THEIR specific goal
+• Stop asking when you have enough — no quotas, no padding
+• The pipeline owns data, libraries, preprocessing, algorithms — never ask about these
+• The report must read like advice from someone who understood their project deeply,
+  not a template with their keywords swapped in
 """,
     tools=[get_current_pipeline_status, save_requirement_report],
 )
@@ -215,9 +385,11 @@ async def run_agent_turn(runner, user_id, session_id, user_text):
             return agent_response
         except Exception as e:
             error_msg = str(e)
-            if "500" in error_msg or "INTERNAL" in error_msg:
-                print(f"\n[WARN] Gemini server error (attempt {attempt + 1}/3). Retrying in 5s...", flush=True)
-                await asyncio.sleep(5)
+            if any(k in error_msg for k in ("500", "503", "INTERNAL", "UNAVAILABLE", "overloaded", "Resource has been exhausted")):
+                wait = 10 if "503" in error_msg or "UNAVAILABLE" in error_msg else 5
+                print(f"\n[WARN] Gemini transient error (attempt {attempt + 1}/3). Retrying in {wait}s...", flush=True)
+                print(f"[WARN] Error: {error_msg[:200]}", flush=True)
+                await asyncio.sleep(wait)
                 if attempt == 2:
                     print("\n[ERROR] Gemini API failed after 3 attempts.", flush=True)
                     return None
@@ -258,9 +430,16 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 1: Requirement Gathering")
     print("=" * 60)
 
+    # Statuses that mean Phase 1 is already complete (any status after report_ready counts)
+    _PHASE1_DONE_STATUSES = {
+        "report_ready", "dataset_ready", "preprocessing_complete",
+        "preprocessing_complete_with_warnings", "ml_plan_ready",
+        "model_trained", "ml_complete", "pipeline_complete",
+    }
+
     # Check if Phase 1 already done
     state = load_state()
-    if state.get("status") == "report_ready" and state.get("user_goal"):
+    if state.get("status") in _PHASE1_DONE_STATUSES and state.get("user_goal") and state.get("report"):
         print(f"\n[PIPELINE] Report already exists for: {state['user_goal'][:80]}...")
         print("[PIPELINE] Skipping Phase 1, moving to Phase 2.\n")
     else:
@@ -277,8 +456,8 @@ async def run_pipeline():
                 print("\n[ERROR] Agent failed to respond. Exiting.")
                 return
 
-            # Check if report was saved
-            if load_state().get("status") == "report_ready":
+            # Check if report was saved (accept any post-Phase-1 status)
+            if load_state().get("status") in _PHASE1_DONE_STATUSES:
                 print("\n[PIPELINE] Phase 1 complete — report saved!")
                 break
 
@@ -296,9 +475,11 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 2: Dataset Extraction")
     print("=" * 60)
 
-    # Check if datasets already downloaded
+    # Check if datasets already downloaded (also verify files exist on disk)
     state = load_state()
-    if state.get("status") == "dataset_ready" and state.get("downloaded_dataset"):
+    ds = state.get("downloaded_dataset", {})
+    ds_path = ds.get("path", "") if isinstance(ds, dict) else ""
+    if state.get("status") == "dataset_ready" and ds_path and Path(ds_path).exists():
         print(f"\n[PIPELINE] Datasets already downloaded. Skipping Phase 2.")
     else:
         SESSION_PHASE2 = "session_phase2"
@@ -312,8 +493,6 @@ async def run_pipeline():
             session_service=session_service,
         )
 
-        # Feed the report to the extractor agent — it reads from pipeline_state
-        # but needs a user message to kick off
         state = load_state()
         kickoff_message = (
             f"Find and download relevant datasets for this ML project.\n"
@@ -323,14 +502,27 @@ async def run_pipeline():
 
         print("\n[PIPELINE] Searching and downloading datasets...\n", flush=True)
 
-        response = await run_agent_turn(
-            phase2_runner, USER_ID, SESSION_PHASE2, kickoff_message
-        )
+        try:
+            response = await asyncio.wait_for(
+                run_agent_turn(phase2_runner, USER_ID, SESSION_PHASE2, kickoff_message),
+                timeout=PHASE2_TIMEOUT if PHASE2_TIMEOUT > 0 else None,
+            )
+        except asyncio.TimeoutError as e:
+            _write_crash_log("Phase 2", e, {"timeout_seconds": PHASE2_TIMEOUT})
+            print(f"\n[ERROR] Phase 2 timed out after {PHASE2_TIMEOUT}s. Exiting.")
+            return
+        except Exception as e:
+            _write_crash_log("Phase 2", e)
+            print(f"\n[ERROR] Phase 2 unexpected error: {e}")
+            return
 
         if response is None:
+            _write_crash_log("Phase 2", RuntimeError("Agent returned None"), {})
             print("\n[ERROR] Dataset extractor failed. Exiting.")
             return
 
+        mark_checkpoint("phase2_complete")
+        backup_state()
         print("\n[PIPELINE] Phase 2 complete — datasets downloaded!")
 
     # ==============================================================
@@ -361,9 +553,11 @@ async def run_pipeline():
     print("  PROMPT2ML — Phase 3: Dataset Preprocessing")
     print("=" * 60)
 
+    _PHASE3_DONE_STATUSES = {"pipeline_complete", "preprocessing_complete", "preprocessing_complete_with_warnings"}
     state = load_state()
-    if state.get("status") == "pipeline_complete" and state.get("report_path"):
-        print(f"\n[PIPELINE] Datasets already preprocessed. Skipping Phase 3.")
+    preprocessed_path = state.get("preprocessed_dataset_path", "")
+    if state.get("status") in _PHASE3_DONE_STATUSES and preprocessed_path and Path(preprocessed_path).exists():
+        print(f"\n[PIPELINE] Datasets already preprocessed (status: {state.get('status')}). Skipping Phase 3.")
     else:
         SESSION_PHASE3 = "session_phase3"
         await session_service.create_session(
@@ -376,24 +570,218 @@ async def run_pipeline():
             session_service=session_service,
         )
 
-        # Feed the report to the preprocessing agent — it reads from pipeline_state
-        # but needs a user message to kick off
-        state = load_state()
         kickoff_message = (
             "Please do the data preprocessing steps for this ML project "
             "based on the user's goal, requirements, and downloaded datasets."
         )
         print("\n[PIPELINE] Preprocessing datasets...\n", flush=True)
 
-        response = await run_agent_turn(
-            phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message
-        )
+        response = None
+        for phase3_attempt in range(3):
+            if phase3_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 3 (attempt {phase3_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(15)
+                SESSION_PHASE3 = f"session_phase3_retry{phase3_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE3
+                )
+                phase3_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=data_preprocessing_agent,
+                    session_service=session_service,
+                )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(phase3_runner, USER_ID, SESSION_PHASE3, kickoff_message),
+                    timeout=PHASE3_TIMEOUT if PHASE3_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 3 attempt {phase3_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE3_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 3 attempt {phase3_attempt + 1} timed out after {PHASE3_TIMEOUT}s.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 3 attempt {phase3_attempt + 1}", e)
+                print(f"\n[WARN] Phase 3 attempt {phase3_attempt + 1} error: {e}", flush=True)
+                response = None
+
+            if response is not None:
+                break
 
         if response is None:
-            print("\n[ERROR] Data preprocessing failed. Exiting.")
+            _write_crash_log("Phase 3", RuntimeError("All 3 attempts failed"), {})
+            print("\n[ERROR] Data preprocessing failed after 3 attempts. Exiting.")
             return
 
+        mark_checkpoint("phase3_complete")
+        backup_state()
         print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
+
+    # ==============================================================
+    # PHASE 4: Preprocessing Report Generation (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 4: Preprocessing Report")
+    print("=" * 60)
+
+    state = load_state()
+    report_path = state.get("report_path", "")
+    if state.get("status") == "pipeline_complete" and report_path and Path(report_path).exists():
+        print(f"\n[PIPELINE] Report already generated at: {report_path}. Skipping Phase 4.")
+    else:
+        SESSION_PHASE4 = "session_phase4"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
+        )
+
+        phase4_runner = Runner(
+            app_name=APP_NAME,
+            agent=report_generator_agent,
+            session_service=session_service,
+        )
+
+        print("\n[PIPELINE] Generating preprocessing report...\n", flush=True)
+
+        response = None
+        for phase4_attempt in range(3):
+            if phase4_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 4 (attempt {phase4_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(10)
+                SESSION_PHASE4 = f"session_phase4_retry{phase4_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
+                )
+                phase4_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=report_generator_agent,
+                    session_service=session_service,
+                )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(
+                        phase4_runner, USER_ID, SESSION_PHASE4,
+                        "Generate the comprehensive preprocessing report for this ML project.",
+                    ),
+                    timeout=PHASE4_TIMEOUT if PHASE4_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 4 attempt {phase4_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE4_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} timed out.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 4 attempt {phase4_attempt + 1}", e)
+                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} error: {e}", flush=True)
+                response = None
+
+            if response is not None:
+                break
+
+        if response is None:
+            _write_crash_log("Phase 4", RuntimeError("All 3 attempts failed"), {})
+            print("\n[ERROR] Report generation failed after 3 attempts.")
+        else:
+            mark_checkpoint("phase4_complete")
+            backup_state()
+            print("\n[PIPELINE] Phase 4 complete — preprocessing report saved!")
+
+    # ==============================================================
+    # PHASE 5: Machine Learning (autonomous)
+    # ==============================================================
+
+    print("\n" + "=" * 60)
+    print("  PROMPT2ML — Phase 5: Machine Learning")
+    print("=" * 60)
+
+    state = load_state()
+    final_report_path = state.get("final_report_path", "")
+    if final_report_path and Path(final_report_path).exists():
+        print(f"\n[PIPELINE] ML pipeline already complete. Skipping Phase 5.")
+        print(f"  Final report: {final_report_path}")
+    else:
+        SESSION_PHASE5 = "session_phase5"
+        await session_service.create_session(
+            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE5
+        )
+
+        phase5_runner = Runner(
+            app_name=APP_NAME,
+            agent=ml_pipeline_agent,
+            session_service=session_service,
+        )
+
+        state = load_state()
+        user_goal = state.get("user_goal", "Train the best ML model for the available dataset.")
+        kickoff_message = (
+            f"Run the complete ML pipeline for this project: {user_goal}\n\n"
+            "Execute all three phases: planning, training, and reporting."
+        )
+        print("\n[PIPELINE] Running ML pipeline (strategy → training → report)...\n", flush=True)
+
+        response = None
+        for phase5_attempt in range(3):
+            if phase5_attempt > 0:
+                print(f"\n[PIPELINE] Retrying Phase 5 (attempt {phase5_attempt + 1}/3)...", flush=True)
+                await asyncio.sleep(15)
+                SESSION_PHASE5 = f"session_phase5_retry{phase5_attempt}"
+                await session_service.create_session(
+                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE5
+                )
+                phase5_runner = Runner(
+                    app_name=APP_NAME,
+                    agent=ml_pipeline_agent,
+                    session_service=session_service,
+                )
+            try:
+                response = await asyncio.wait_for(
+                    run_agent_turn(phase5_runner, USER_ID, SESSION_PHASE5, kickoff_message),
+                    timeout=PHASE5_TIMEOUT if PHASE5_TIMEOUT > 0 else None,
+                )
+            except asyncio.TimeoutError as e:
+                _write_crash_log(
+                    f"Phase 5 attempt {phase5_attempt + 1}",
+                    e,
+                    {"timeout_seconds": PHASE5_TIMEOUT},
+                )
+                print(f"\n[WARN] Phase 5 attempt {phase5_attempt + 1} timed out after {PHASE5_TIMEOUT}s.", flush=True)
+                response = None
+            except Exception as e:
+                _write_crash_log(f"Phase 5 attempt {phase5_attempt + 1}", e)
+                print(f"\n[WARN] Phase 5 attempt {phase5_attempt + 1} error: {e}", flush=True)
+                response = None
+
+            if response is not None:
+                break
+
+        if response is None:
+            _write_crash_log("Phase 5", RuntimeError("All 3 attempts failed"), {})
+            print("\n[ERROR] ML pipeline failed after 3 attempts.")
+        else:
+            mark_checkpoint("phase5_complete")
+            backup_state()
+            print("\n[PIPELINE] Phase 5 complete — ML pipeline finished!")
+
+    # ==============================================================
+    # FINAL STATUS
+    # ==============================================================
+
+    final_state = load_state()
+    print("\n" + "=" * 60)
+    print("  FINAL PIPELINE STATUS")
+    print("=" * 60)
+    print(f"  Status           : {final_state.get('status', 'unknown')}")
+    print(f"  Preprocessed     : {final_state.get('preprocessed_dataset_path', 'N/A')}")
+    print(f"  Preprocessing Rpt: {final_state.get('report_path', 'N/A')}")
+    print(f"  Best Model       : {final_state.get('best_model_path', 'N/A')}")
+    print(f"  Final ML Report  : {final_state.get('final_report_path', 'N/A')}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

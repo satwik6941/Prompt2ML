@@ -1,265 +1,675 @@
 """
-OpenSandbox Executor — Secure code execution for data preprocessing agents.
+Docker SDK Executor — Secure code execution for data preprocessing agents.
 
-Provides three ADK-compatible async tool functions:
-    - run_in_sandbox(command)      → execute shell commands
-    - write_file_to_sandbox(path, content) → write files into sandbox
-    - read_file_from_sandbox(path) → read files from sandbox
+Replaces the safeexecute package with a direct Docker SDK approach, eliminating
+the Windows \r\n line-ending bugs that plagued the previous implementation.
 
-The sandbox is a Docker container with Python + data science libraries.
-It is created once and reused across all tool calls, then killed at the end.
+Architecture:
+  - One persistent container named `prompt2ml-pipeline` per pipeline run.
+  - The host's run-specific workspace directory is mounted as /workspace inside
+    the container. Files written there by built-in tools are immediately visible
+    to sandbox scripts — no upload/download needed.
+  - Code execution works by writing a temp .py file into /workspace on the host,
+    running `docker exec <container> python /workspace/_exec_<uuid>.py`, then
+    deleting the temp file.
+  - Missing pip dependencies are detected by parsing import statements and
+    auto-installed into the running container before code executes.
 
-Usage:
-    executor = SandboxExecutor()
-    await executor.start()
-    # ... use executor.run_in_sandbox, executor.write_file_to_sandbox, etc.
-    await executor.stop()
+Public API (signatures are identical to the safeexecute-based version):
+    start_sandbox()                          — build/start container, pre-check deps
+    stop_sandbox()                           — stop and remove container
+    run_in_sandbox(code)                     — execute Python code, returns JSON
+    write_file_to_sandbox(filename, content) — write a file into /workspace
+    read_file_from_sandbox(filename)         — read a file from /workspace
+    upload_dataset_to_sandbox(local_path)    — no-op shim (volume-mounted)
+    download_from_sandbox(sandbox_fn, local) — no-op shim (volume-mounted)
+
+ERROR HANDLING:
+  - start_sandbox returns {"error": "...", "error_type": "docker_not_running"} when
+    Docker Desktop is not started.
+  - run_in_sandbox returns {"success": false, "error_type": "..."} on failure.
+  - Agents MUST check for "error" key before proceeding.
 """
 
-import os
+import ast
 import json
-from datetime import timedelta
+import sys
+import uuid
 from pathlib import Path
-from opensandbox import Sandbox
-from opensandbox.config import ConnectionConfig
+
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+from pipeline_state import get_run_dir, reset_run_dir_cache  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Module-level globals
+# ---------------------------------------------------------------------------
+
+# Resolved at sandbox start time (not import time) so the slug is always
+# based on the user_goal already saved to pipeline_state.json.
+WORKSPACE: str = ""
+
+# The docker Container object — set by start_sandbox(), used everywhere else.
+_container = None  # type: ignore[assignment]
+
+# Idempotency flag
+_started: bool = False
+
+# Docker image and container name
+_IMAGE_NAME = "prompt2ml-sandbox:latest"
+_CONTAINER_NAME = "prompt2ml-pipeline"
+
+# ---------------------------------------------------------------------------
+# Import → pip package name mapping
+# stdlib modules are skipped (no pip install needed).
+# ---------------------------------------------------------------------------
+
+IMPORT_TO_PIP: dict[str, str] = {
+    "sklearn": "scikit-learn",
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "yaml": "PyYAML",
+    "bs4": "beautifulsoup4",
+    "imblearn": "imbalanced-learn",
+    "xlrd": "xlrd",
+    "openpyxl": "openpyxl",
+    "xlsxwriter": "XlsxWriter",
+    "catboost": "catboost",
+    "xgboost": "xgboost",
+    "lightgbm": "lightgbm",
+    "statsmodels": "statsmodels",
+    "plotly": "plotly",
+    "seaborn": "seaborn",
+    "scipy": "scipy",
+    "joblib": "joblib",
+    "tqdm": "tqdm",
+    "nltk": "nltk",
+    "torch": "torch",
+    "tensorflow": "tensorflow",
+    "keras": "keras",
+}
+
+# Standard library modules — never attempt to pip-install these.
+STDLIB_MODULES: set[str] = {
+    "os", "sys", "json", "re", "math", "random", "time", "datetime",
+    "pathlib", "collections", "itertools", "functools", "io", "abc",
+    "copy", "gc", "glob", "hashlib", "logging", "pickle", "shutil",
+    "socket", "string", "struct", "subprocess", "tempfile", "threading",
+    "traceback", "typing", "unittest", "urllib", "uuid", "warnings",
+    "csv", "ast", "base64", "binascii", "builtins", "codecs", "contextlib",
+    "dataclasses", "decimal", "enum", "gzip", "html", "http", "inspect",
+    "operator", "platform", "pprint", "queue", "signal", "stat", "textwrap",
+    "tokenize", "types", "weakref", "zipfile", "zlib", "argparse", "getpass",
+    "importlib", "numbers", "sqlite3", "xml", "xmlrpc", "email", "array",
+    "bisect", "calendar", "cmath", "cProfile", "difflib", "dis", "fcntl",
+    "fractions", "getopt", "heapq", "hmac", "imaplib", "ipaddress",
+    "keyword", "linecache", "locale", "mimetypes", "multiprocessing",
+    "netrc", "optparse", "posixpath", "profile", "pstats", "pty", "pwd",
+    "readline", "reprlib", "rlcompleter", "sched", "select", "shelve",
+    "shlex", "smtplib", "sndhdr", "spwd", "statistics", "string",
+    "tabnanny", "telnetlib", "termios", "test", "token", "turtle",
+    "turtledemo", "unicodedata",
+    # commonly pre-installed heavy packages (no need to re-pip them)
+    "numpy", "pandas", "matplotlib", "sklearn", "scipy", "seaborn",
+    "plotly", "joblib",
+}
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_workspace() -> str:
+    """Resolve the run-specific workspace and ensure the directory exists."""
+    run_dir = get_run_dir()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return str(run_dir)
 
 
-# Default sandbox image with Python + data science libs
-DEFAULT_IMAGE = "opensandbox/code-interpreter:v1.0.2"
+def _is_docker_daemon_error(exc: Exception) -> bool:
+    """Detect whether the exception means the Docker daemon isn't reachable."""
+    msg = str(exc).lower()
+    return any(k in msg for k in (
+        "pipe", "createfile", "cannot find the file", "docker",
+        "connection refused", "fetching server api", "is the docker daemon running",
+        "error while fetching", "2375", "named pipe",
+    ))
 
-# Paths inside the sandbox
-SANDBOX_DATA_DIR = "/workspace/data"
-SANDBOX_OUTPUT_DIR = "/workspace/output"
+
+def _parse_imports(code: str) -> list[str]:
+    """
+    Parse Python source code and return a list of top-level module names
+    referenced in import statements.
+
+    Handles:
+        import numpy
+        import numpy as np
+        from sklearn import metrics
+        from sklearn.linear_model import ...
+    """
+    module_names: list[str] = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # If we can't parse, fall back to a quick line scan.
+        for line in code.splitlines():
+            line = line.strip()
+            if line.startswith("import "):
+                rest = line[len("import "):].split("#")[0]
+                for part in rest.split(","):
+                    name = part.strip().split(" ")[0].split(".")[0]
+                    if name:
+                        module_names.append(name)
+            elif line.startswith("from "):
+                rest = line[len("from "):].split(" import")[0].strip()
+                top = rest.split(".")[0]
+                if top:
+                    module_names.append(top)
+        return module_names
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                module_names.append(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top = node.module.split(".")[0]
+                module_names.append(top)
+
+    return module_names
 
 
-class SandboxExecutor:
-    """Manages an OpenSandbox container lifecycle and provides tool functions."""
+def _get_client():
+    """Return a connected docker.DockerClient, or raise with a clear message."""
+    try:
+        import docker  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "docker package not installed. Run: pip install docker"
+        ) from exc
+    try:
+        client = docker.from_env()
+        client.ping()  # verify the daemon is actually reachable
+        return client
+    except Exception as exc:
+        raise exc
 
-    def __init__(
-        self,
-        domain: str = None,
-        api_key: str = None,
-        image: str = None,
-        timeout_minutes: int = 30,
-    ):
-        self.domain = domain or os.getenv("SANDBOX_DOMAIN", "localhost:8080")
-        self.api_key = api_key or os.getenv("SANDBOX_API_KEY")
-        self.image = image or os.getenv("SANDBOX_IMAGE", DEFAULT_IMAGE)
-        self.timeout_minutes = timeout_minutes
-        self.sandbox = None
 
-    async def start(self):
-        """Create and start the sandbox container."""
-        config = ConnectionConfig(
-            domain=self.domain,
-            api_key=self.api_key,
-            request_timeout=timedelta(seconds=120),
+def _exec_in_container(cmd: list[str], workdir: str = "/workspace"):
+    """
+    Run a command inside the running container and return (exit_code, output).
+    `output` is a single string combining stdout and stderr.
+    """
+    if _container is None:
+        raise RuntimeError("Container is not started. Call start_sandbox() first.")
+    result = _container.exec_run(
+        cmd,
+        stdout=True,
+        stderr=True,
+        workdir=workdir,
+    )
+    output = result.output.decode("utf-8", errors="replace") if result.output else ""
+    return result.exit_code, output
+
+
+# ---------------------------------------------------------------------------
+# Dependency management
+# ---------------------------------------------------------------------------
+
+def _check_and_install_deps(imports: list[str]) -> dict:
+    """
+    For each import name that isn't in stdlib:
+      1. Try to import it inside the container.
+      2. Collect failures, map them to pip package names.
+      3. Run a single `pip install` for all missing packages.
+      4. Return a dict describing what was done.
+    """
+    # De-duplicate and filter stdlib
+    candidates = list(dict.fromkeys(
+        name for name in imports
+        if name and name not in STDLIB_MODULES
+    ))
+
+    if not candidates:
+        return {"installed": [], "note": "no external imports detected"}
+
+    missing_pip: list[str] = []
+    for name in candidates:
+        exit_code, _ = _exec_in_container(
+            ["python", "-c", f"import {name}"]
         )
+        if exit_code != 0:
+            # Map import name to pip package name (fall back to import name itself)
+            pip_name = IMPORT_TO_PIP.get(name, name)
+            missing_pip.append(pip_name)
 
-        self.sandbox = await Sandbox.create(
-            self.image,
-            connection_config=config,
-            entrypoint=["/opt/opensandbox/code-interpreter.sh"],
-            env={"PYTHON_VERSION": "3.11"},
-            timeout=timedelta(minutes=self.timeout_minutes),
-        )
+    if not missing_pip:
+        return {"installed": [], "note": "all imports already available"}
 
-        # Create working directories inside sandbox
-        await self.sandbox.commands.run(f"mkdir -p {SANDBOX_DATA_DIR} {SANDBOX_OUTPUT_DIR}")
-        print(f"[SANDBOX] Started sandbox container", flush=True)
+    print(f"[SANDBOX] Installing missing packages: {missing_pip}", flush=True)
+    exit_code, output = _exec_in_container(
+        ["pip", "install", "--quiet", "--no-warn-script-location"] + missing_pip
+    )
+    if exit_code != 0:
+        print(f"[SANDBOX WARNING] pip install returned {exit_code}: {output[-400:]}", flush=True)
+        return {
+            "installed": missing_pip,
+            "returncode": exit_code,
+            "errors": output.strip()[-400:],
+        }
 
-    async def stop(self):
-        """Kill and clean up the sandbox container."""
-        if self.sandbox:
-            try:
-                await self.sandbox.kill()
-                await self.sandbox.close()
-                print("[SANDBOX] Sandbox container stopped", flush=True)
-            except Exception as e:
-                print(f"[SANDBOX] Warning during cleanup: {e}", flush=True)
-            self.sandbox = None
-
-    async def upload_dataset(self, local_path: str) -> str:
-        """
-        Upload a local dataset file into the sandbox.
-        Returns the path inside the sandbox.
-        """
-        local_file = Path(local_path)
-        if not local_file.exists():
-            return json.dumps({"error": f"Local file not found: {local_path}"})
-
-        sandbox_path = f"{SANDBOX_DATA_DIR}/{local_file.name}"
-        content = local_file.read_text(encoding="utf-8", errors="ignore")
-        await self.sandbox.files.write_file(sandbox_path, content)
-        print(f"[SANDBOX] Uploaded {local_file.name} → {sandbox_path}", flush=True)
-        return sandbox_path
-
-    async def download_file(self, sandbox_path: str, local_path: str) -> str:
-        """
-        Download a file from the sandbox to the local filesystem.
-        Returns the local path.
-        """
-        content = await self.sandbox.files.read_file(sandbox_path)
-        local_file = Path(local_path)
-        local_file.parent.mkdir(parents=True, exist_ok=True)
-        local_file.write_text(content, encoding="utf-8")
-        print(f"[SANDBOX] Downloaded {sandbox_path} → {local_path}", flush=True)
-        return local_path
+    print(f"[SANDBOX] Installed: {missing_pip}", flush=True)
+    return {"installed": missing_pip, "returncode": 0}
 
 
-# ============================================================
-# Module-level singleton — shared across all tool calls
-# ============================================================
-
-_executor = SandboxExecutor()
-
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 async def start_sandbox() -> str:
     """
-    Start the OpenSandbox container. Call this ONCE at the beginning
-    of preprocessing before using any other sandbox tools.
+    Start the Docker sandbox container (or reuse one that's already running).
+
+    Steps:
+      1. Resolve the run-specific workspace directory.
+      2. Connect to Docker daemon.
+      3. Verify the image `prompt2ml-sandbox:latest` exists.
+      4. Create/start the `prompt2ml-pipeline` container with /workspace mounted.
+      5. Run a warmup Python snippet to verify the interpreter works.
 
     Returns:
-        Confirmation message with sandbox status.
+        JSON {"status": "sandbox_started", "workspace": "..."} on success.
+        JSON {"error": "...", "error_type": "<type>"} on failure.
+        error_type values:
+            "import_error"        — `docker` package missing
+            "docker_not_running"  — Docker Desktop not started
+            "image_not_found"     — image hasn't been built yet
+            "sandbox_start_error" — anything else
     """
-    await _executor.start()
-    return json.dumps({"status": "sandbox_started", "data_dir": SANDBOX_DATA_DIR, "output_dir": SANDBOX_OUTPUT_DIR})
+    global _container, _started, WORKSPACE
+
+    WORKSPACE = _ensure_workspace()
+
+    # --- 1. Import docker SDK ---
+    try:
+        import docker  # type: ignore
+    except ImportError:
+        msg = "docker package not installed. Run: pip install docker"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({
+            "error": msg,
+            "error_type": "import_error",
+            "action": "Run `pip install docker` then retry.",
+        })
+
+    # --- 2. Connect to Docker daemon ---
+    try:
+        client = _get_client()
+    except ImportError:
+        # Already handled above, but guard for completeness.
+        pass
+    except Exception as exc:
+        if _is_docker_daemon_error(exc):
+            msg = (
+                "Docker Desktop is not running. "
+                "Please start Docker Desktop and wait for it to fully initialise, then retry."
+            )
+            error_type = "docker_not_running"
+        else:
+            msg = f"Cannot connect to Docker: {exc}"
+            error_type = "sandbox_start_error"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({
+            "error": msg,
+            "error_type": error_type,
+            "action": (
+                "Start Docker Desktop (system tray) and call start_sandbox again."
+                if error_type == "docker_not_running"
+                else "Check Docker installation."
+            ),
+        })
+
+    # --- 3. Verify image exists ---
+    try:
+        client.images.get(_IMAGE_NAME)
+    except docker.errors.ImageNotFound:
+        msg = (
+            f"Image `{_IMAGE_NAME}` not found. "
+            "Build it first by running `docker/build.ps1` from the project root."
+        )
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({
+            "error": msg,
+            "error_type": "image_not_found",
+            "action": "Run `docker/build.ps1` (or `docker build -t prompt2ml-sandbox:latest docker/`) to build the image.",
+        })
+    except Exception as exc:
+        msg = f"Failed to check Docker image: {exc}"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({"error": msg, "error_type": "sandbox_start_error"})
+
+    # --- 4. Create or reuse container ---
+    try:
+        existing = client.containers.get(_CONTAINER_NAME)
+        existing.reload()
+        if existing.status == "running":
+            _container = existing
+            print(f"[SANDBOX] Reusing running container '{_CONTAINER_NAME}'.", flush=True)
+        else:
+            # Container exists but isn't running — start it.
+            print(f"[SANDBOX] Container '{_CONTAINER_NAME}' found (status={existing.status}), starting...", flush=True)
+            existing.start()
+            existing.reload()
+            _container = existing
+    except docker.errors.NotFound:
+        # Container doesn't exist yet — create it fresh.
+        print(f"[SANDBOX] Creating container '{_CONTAINER_NAME}'...", flush=True)
+        try:
+            _container = client.containers.run(
+                _IMAGE_NAME,
+                name=_CONTAINER_NAME,
+                detach=True,
+                volumes={
+                    WORKSPACE: {
+                        "bind": "/workspace",
+                        "mode": "rw",
+                    }
+                },
+                working_dir="/workspace",
+                # Keep container alive indefinitely with a no-op tail command.
+                command="tail -f /dev/null",
+                remove=False,
+            )
+            print(f"[SANDBOX] Container '{_CONTAINER_NAME}' created.", flush=True)
+        except Exception as exc:
+            msg = f"Failed to create container: {exc}"
+            print(f"[SANDBOX ERROR] {msg}", flush=True)
+            return json.dumps({"error": msg, "error_type": "sandbox_start_error"})
+    except Exception as exc:
+        msg = f"Error accessing container: {exc}"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({"error": msg, "error_type": "sandbox_start_error"})
+
+    # --- 5. Warmup verification ---
+    try:
+        exit_code, output = _exec_in_container(
+            ["python", "-c", "import sys; print(f'Python {sys.version[:6]} ready')"]
+        )
+        if exit_code != 0:
+            msg = f"Container warmup failed (exit {exit_code}): {output}"
+            print(f"[SANDBOX ERROR] {msg}", flush=True)
+            return json.dumps({"error": msg, "error_type": "sandbox_start_error"})
+        _started = True
+        print(f"[SANDBOX] Started — workspace: {WORKSPACE}", flush=True)
+        print(f"[SANDBOX] {output.strip()}", flush=True)
+    except Exception as exc:
+        msg = f"Warmup exec failed: {exc}"
+        print(f"[SANDBOX ERROR] {msg}", flush=True)
+        return json.dumps({"error": msg, "error_type": "sandbox_start_error"})
+
+    return json.dumps({
+        "status": "sandbox_started",
+        "workspace": WORKSPACE,
+        "container_name": _CONTAINER_NAME,
+        "container_note": f"host {WORKSPACE} is mounted as /workspace inside the container",
+    })
 
 
 async def stop_sandbox() -> str:
     """
-    Stop and clean up the OpenSandbox container. Call this ONCE
-    after all preprocessing is complete.
+    Stop and remove the sandbox container, freeing Docker resources.
+
+    Safe to call even if start_sandbox() failed — no-op in that case.
 
     Returns:
-        Confirmation message.
+        JSON {"status": "sandbox_stopped"} on success.
+        JSON {"status": "sandbox_not_running"} if sandbox was never started.
     """
-    await _executor.stop()
+    global _container, _started
+
+    if not _started or _container is None:
+        print("[SANDBOX] stop_sandbox called but sandbox was not running — no-op.", flush=True)
+        return json.dumps({"status": "sandbox_not_running", "note": "Nothing to stop."})
+
+    try:
+        _container.reload()
+        if _container.status == "running":
+            _container.stop(timeout=10)
+        _container.remove()
+        print(f"[SANDBOX] Container '{_CONTAINER_NAME}' stopped and removed.", flush=True)
+    except Exception as exc:
+        note = str(exc)
+        print(f"[SANDBOX] stop_sandbox: container may already be gone ({note})", flush=True)
+        return json.dumps({"status": "sandbox_stopped", "note": note})
+    finally:
+        _container = None
+        _started = False
+
     return json.dumps({"status": "sandbox_stopped"})
 
 
+async def run_in_sandbox(code: str) -> str:
+    """
+    Execute Python code inside the sandbox container.
+
+    Workflow:
+      1. Parse the code to find import statements.
+      2. Auto-install any missing pip packages into the running container.
+      3. Write the code to a uniquely-named temp file in /workspace on the host.
+      4. Execute it via `docker exec python /workspace/_exec_<uuid>.py`.
+      5. Delete the temp file.
+      6. Return JSON with success/failure and captured output.
+
+    The container's /workspace is the host's run-specific workspace folder.
+    Any CSV/JSON files already there are readable as:
+        pd.read_csv('/workspace/<filename>.csv')
+    Results saved to /workspace/ are immediately available on the host.
+
+    Args:
+        code: Python source code to execute. Use /workspace/ paths for file I/O.
+
+    Returns:
+        JSON {"success": true, "stdout": "..."} on success.
+        JSON {"success": false, "stderr": "...", "error_type": "..."} on failure.
+        Always check the "success" key before using the output.
+    """
+    # Normalise line endings — Docker exec sends the file as-is; keep it clean.
+    code = code.replace("\r\n", "\n").replace("\r", "\n")
+
+    if not _started or _container is None:
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": "Sandbox is not running.",
+            "error_type": "not_started",
+            "action": (
+                "Call start_sandbox() first. "
+                "If start_sandbox returned an error, check that Docker Desktop is running."
+            ),
+        })
+
+    # --- Auto-install missing dependencies ---
+    try:
+        imports = _parse_imports(code)
+        dep_result = _check_and_install_deps(imports)
+        if dep_result.get("installed"):
+            print(f"[SANDBOX] Auto-installed packages: {dep_result['installed']}", flush=True)
+    except Exception as dep_exc:
+        # Dependency check is best-effort — don't abort the run.
+        print(f"[SANDBOX WARNING] Dependency check failed: {dep_exc}", flush=True)
+
+    # --- Write temp script to workspace ---
+    script_name = f"_exec_{uuid.uuid4().hex[:8]}.py"
+    script_host_path = Path(WORKSPACE) / script_name
+    try:
+        script_host_path.write_text(code, encoding="utf-8", newline="\n")
+    except Exception as write_exc:
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": f"Failed to write temp script: {write_exc}",
+            "error_type": "io_error",
+            "action": f"Check that {WORKSPACE} is writable.",
+        })
+
+    # --- Execute inside container ---
+    try:
+        exit_code, output = _exec_in_container(
+            ["python", f"/workspace/{script_name}"]
+        )
+    except Exception as exec_exc:
+        try:
+            script_host_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if _is_docker_daemon_error(exec_exc):
+            error_type = "docker_not_running"
+            action = "Start Docker Desktop and call start_sandbox() again."
+        else:
+            error_type = "execution_error"
+            action = "Check the code for syntax errors and try again."
+        print(f"[SANDBOX ERROR] run_in_sandbox exec failed ({error_type}): {exec_exc}", flush=True)
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": str(exec_exc),
+            "error_type": error_type,
+            "action": action,
+        })
+    finally:
+        # Always remove temp script
+        try:
+            script_host_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    # --- Return result ---
+    if exit_code == 0:
+        return json.dumps({
+            "success": True,
+            "stdout": output.strip(),
+        }, indent=2)
+    else:
+        print(f"[SANDBOX] Code exited with code {exit_code}. stderr:\n{output[-600:]}", flush=True)
+        return json.dumps({
+            "success": False,
+            "stdout": "",
+            "stderr": output.strip(),
+            "error_type": "execution_error",
+            "action": (
+                "Review the stderr output above, fix the code, and call run_in_sandbox again. "
+                "Common causes: wrong file paths (use /workspace/), missing return values, "
+                "or a package that needs to be installed."
+            ),
+        })
+
+
+async def write_file_to_sandbox(filename: str, content: str) -> str:
+    """
+    Write a Python script or text file into /workspace so run_in_sandbox can use it.
+
+    Because /workspace is the host's workspace folder, this just writes the file
+    to disk — no Docker API call needed. Works even if Docker is not running.
+
+    Args:
+        filename: Filename only (e.g. 'preprocess.py'). Written to WORKSPACE/.
+        content:  Full text content of the file.
+
+    Returns:
+        JSON with the host path and equivalent /workspace path.
+    """
+    workspace = Path(_ensure_workspace())
+    dest = workspace / filename
+    # Normalise line endings before writing — avoids \r\n issues inside Linux containers.
+    clean_content = content.replace("\r\n", "\n").replace("\r", "\n")
+    dest.write_text(clean_content, encoding="utf-8", newline="\n")
+    print(f"[SANDBOX] Wrote file -> {dest}", flush=True)
+    return json.dumps({
+        "status": "written",
+        "host_path": str(dest),
+        "sandbox_path": f"/workspace/{filename}",
+        "bytes": len(clean_content),
+    })
+
+
+async def read_file_from_sandbox(filename: str) -> str:
+    """
+    Read a file that was written by a sandbox script to /workspace.
+
+    Because /workspace is the host's workspace folder, this just reads
+    the file from disk.
+
+    Args:
+        filename: Filename only (e.g. 'result.csv'). Read from WORKSPACE/.
+
+    Returns:
+        File content as a string (truncated to 50 000 chars if large).
+        JSON {"error": "..."} if the file does not exist.
+    """
+    src = Path(_ensure_workspace()) / filename
+    if not src.exists():
+        return json.dumps({"error": f"File not found: {src}"})
+
+    content = src.read_text(encoding="utf-8", errors="ignore")
+    if len(content) > 50_000:
+        content = content[:50_000] + f"\n\n[TRUNCATED — showing first 50 000 of {len(content)} chars]"
+    return content
+
+
+# ---------------------------------------------------------------------------
+# Legacy compatibility shims
+# With volume mounting the shared /workspace means no transfer is needed —
+# these functions just return the path that's already accessible.
+# ---------------------------------------------------------------------------
+
 async def upload_dataset_to_sandbox(local_file_path: str) -> str:
     """
-    Upload a local dataset file into the sandbox environment.
-    The file will be available at /workspace/data/<filename> inside the sandbox.
+    No-op shim for backward compatibility.
+
+    With the volume-mounted /workspace, any file already in the workspace is
+    immediately accessible from inside the container. No upload step is needed.
 
     Args:
-        local_file_path: Absolute path to the local file to upload.
+        local_file_path: Absolute host path to the file.
 
     Returns:
-        JSON with the sandbox path where the file was uploaded.
+        JSON with the equivalent /workspace path inside the container.
     """
-    sandbox_path = await _executor.upload_dataset(local_file_path)
-    if sandbox_path.startswith("{"):
-        return sandbox_path  # Error JSON
-    return json.dumps({"status": "uploaded", "sandbox_path": sandbox_path, "local_path": local_file_path})
+    local = Path(local_file_path)
+    if not local.exists():
+        return json.dumps({"error": f"File not found: {local_file_path}"})
+
+    sandbox_path = f"/workspace/{local.name}"
+    return json.dumps({
+        "status": "available",
+        "sandbox_path": sandbox_path,
+        "local_path": local_file_path,
+        "note": "No upload needed — workspace directory is mounted as /workspace",
+    })
 
 
-async def run_in_sandbox(command: str) -> str:
+async def download_from_sandbox(sandbox_filename: str, local_path: str) -> str:
     """
-    Run a shell command inside the OpenSandbox container.
-    Use this to execute Python scripts, install packages, or run any shell command.
+    No-op shim for backward compatibility.
 
-    The sandbox has Python with pandas, numpy, scikit-learn, scipy, matplotlib, seaborn.
-    Data files are in /workspace/data/ and outputs go to /workspace/output/.
+    With the volume-mounted /workspace, files written by sandbox scripts are
+    immediately on the host. This function just confirms the file exists.
 
     Args:
-        command: Shell command to execute (e.g. 'python3 /workspace/data/preprocess.py'
-                 or 'pip install xgboost' or 'ls /workspace/data/').
+        sandbox_filename: Filename or /workspace/<filename> path.
+        local_path:       Expected local path (for logging/confirmation).
 
     Returns:
-        JSON with stdout, stderr, and success status.
+        JSON with the local path, or an error if neither location has the file.
     """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        execution = await _executor.sandbox.commands.run(command)
-        stdout = "\n".join(msg.text for msg in execution.logs.stdout)
-        stderr = "\n".join(msg.text for msg in execution.logs.stderr)
-
-        if execution.error:
-            stderr = "\n".join([
-                stderr,
-                f"[error] {execution.error.name}: {execution.error.value}",
-            ]).strip()
-
+    filename = Path(sandbox_filename).name
+    actual = Path(_ensure_workspace()) / filename
+    if actual.exists():
         return json.dumps({
-            "success": not bool(execution.error),
-            "stdout": stdout.strip(),
-            "stderr": stderr.strip(),
-        }, indent=2)
-    except Exception as e:
-        return json.dumps({"success": False, "stdout": "", "stderr": str(e)})
-
-
-async def write_file_to_sandbox(sandbox_path: str, content: str) -> str:
-    """
-    Write a file inside the sandbox environment.
-    Use this to create Python scripts, config files, or any text file.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/data/preprocess.py').
-        content: The full text content to write.
-
-    Returns:
-        Confirmation with bytes written.
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        await _executor.sandbox.files.write_file(sandbox_path, content)
-        return json.dumps({
-            "status": "written",
-            "path": sandbox_path,
-            "bytes": len(content),
+            "status": "available",
+            "local_path": str(actual),
+            "note": "File already on host — no download needed",
         })
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-async def read_file_from_sandbox(sandbox_path: str) -> str:
-    """
-    Read a file from the sandbox environment.
-    Use this to read results, processed data, or any file.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/output/result.csv').
-
-    Returns:
-        The file content as a string (first 50000 chars if large).
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        content = await _executor.sandbox.files.read_file(sandbox_path)
-        # Truncate very large files to avoid overwhelming the LLM context
-        if len(content) > 50000:
-            content = content[:50000] + f"\n\n[TRUNCATED — showing first 50000 of {len(content)} chars]"
-        return content
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-async def download_from_sandbox(sandbox_path: str, local_path: str) -> str:
-    """
-    Download a file from the sandbox to the local filesystem.
-    Use this to save preprocessed datasets back to the local machine.
-
-    Args:
-        sandbox_path: Path inside the sandbox (e.g. '/workspace/output/preprocessed.csv').
-        local_path: Absolute local path to save the file to.
-
-    Returns:
-        JSON with the local path where the file was saved.
-    """
-    if not _executor.sandbox:
-        return json.dumps({"error": "Sandbox not started. Call start_sandbox first."})
-
-    try:
-        result = await _executor.download_file(sandbox_path, local_path)
-        return json.dumps({"status": "downloaded", "sandbox_path": sandbox_path, "local_path": result})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+    if Path(local_path).exists():
+        return json.dumps({"status": "available", "local_path": local_path})
+    return json.dumps({"error": f"File not found at {actual} or {local_path}"})
