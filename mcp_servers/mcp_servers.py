@@ -1,7 +1,14 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
+
+# Load .env before reading tokens — this module may be imported before the caller's load_dotenv
+_PROJECT_ROOT = Path(__file__).parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(Path(__file__).parent / ".env")
 
 HUGGING_FACE_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")

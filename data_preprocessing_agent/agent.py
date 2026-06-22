@@ -348,9 +348,9 @@ def load_dataset_profile() -> str:
 
 def get_user_requirements() -> str:
     """
-    Load the user's original goal, Q&A pairs, report, and Agent 1's
-    selection reason from pipeline_state.json. This gives full context
-    for creating a preprocessing plan aligned with the user's ML goal.
+    Load the user's original goal, Q&A pairs, report, Agent 1's selection, and
+    pre-phase research findings from pipeline_state.json. The preprocessing_research
+    field contains research-backed technique recommendations from the research agent.
     """
     state = load_state()
     requirements = {
@@ -358,6 +358,7 @@ def get_user_requirements() -> str:
         "qa_pairs": state.get("qa_pairs", []),
         "report_summary": state.get("report", "")[:4000] if state.get("report") else "",
         "agent1_selection": _latest(state.get("agent1_output")).get("selected_dataset", {}),
+        "preprocessing_research": state.get("preprocessing_research", {}),
     }
     return json.dumps(requirements, indent=2, default=str)
 
@@ -572,8 +573,10 @@ def _safe_write_csv(df, output_path: str) -> str | None:
 def get_preprocessing_context() -> str:
     """
     Load everything Agent 3 needs: user goal, Agent 1's dataset selection,
-    Agent 2's preprocessing plan, the dataset file path, and any previous
-    validation feedback from Agent 4 (for retry loops).
+    Agent 2's preprocessing plan, the dataset file path, previous validation
+    feedback from Agent 4 (for retry loops), and pre-phase research findings.
+    The preprocessing_research field contains library API notes and technique
+    recommendations from the research agent that ran before this phase.
     """
     state = load_state()
     agent1_output = state.get("agent1_output", [])
@@ -587,6 +590,7 @@ def get_preprocessing_context() -> str:
         "iteration": state.get("loop_iteration", 0),
         "previous_attempts": state.get("agent3_iterations", []),
         "previous_validations": state.get("agent4_iterations", []),
+        "preprocessing_research": state.get("preprocessing_research", {}),
     }
     return json.dumps(context, indent=2, default=str)
 
@@ -2962,12 +2966,139 @@ RULES:
 
 
 # ============================================================
+# ==================  PREPROCESSING RESEARCH AGENT  ==========
+# ============================================================
+
+from tavily import TavilyClient as _TavilyClient
+_tavily_pp = _TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
+
+
+
+def _pp_search(query: str, domain_filter: str = "all") -> str:
+    """
+    Search the web for preprocessing techniques, library docs, or SOTA methods.
+
+    Args:
+        query: e.g. 'sklearn ColumnTransformer Pipeline best practices 2025'
+        domain_filter: comma-separated domains or 'all'.
+            e.g. 'scikit-learn.org,pandas.pydata.org' or 'paperswithcode.com,kaggle.com'
+    Returns:
+        JSON with title, url, snippet per result.
+    """
+    try:
+        kwargs: dict = {"query": query, "search_depth": "advanced", "max_results": 5}
+        if domain_filter and domain_filter.lower() != "all":
+            kwargs["include_domains"] = [d.strip() for d in domain_filter.split(",")]
+        resp = _tavily_pp.search(**kwargs)
+        return json.dumps([
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")[:600]}
+            for r in resp.get("results", [])
+        ], indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _pp_save_research(
+    recommended_techniques: str,
+    library_api_notes: str,
+    feature_engineering_ideas: str,
+    step_order: str,
+    class_imbalance_strategy: str,
+    warnings: str,
+) -> str:
+    """
+    Save preprocessing research so the Strategist agent (next) reads it immediately.
+
+    Args:
+        recommended_techniques: Best technique per data type with justification.
+        library_api_notes: Exact sklearn/pandas function names and key parameters.
+        feature_engineering_ideas: Concrete new columns to create.
+        step_order: Ordered preprocessing steps (e.g. 'dedup → fix_types → nulls → encode → scale → validate').
+        class_imbalance_strategy: SMOTE/class_weight recommendation, or 'N/A' for regression.
+        warnings: Data leakage risks, deprecated APIs, encoding pitfalls.
+    Returns:
+        Confirmation JSON.
+    """
+    save_state({
+        "preprocessing_research": {
+            "recommended_techniques": recommended_techniques,
+            "library_api_notes": library_api_notes,
+            "feature_engineering_ideas": feature_engineering_ideas,
+            "step_order": step_order,
+            "class_imbalance_strategy": class_imbalance_strategy,
+            "warnings": warnings,
+        }
+    })
+    return json.dumps({"status": "saved"}, indent=2)
+
+
+_pp_research_tools = [get_project_context, _pp_search, _pp_save_research]
+
+_preprocessing_research_agent = Agent(
+    model="gemini-3.1-flash-lite",
+    name="preprocessing_research_agent",
+    description="Researches optimal preprocessing techniques and library APIs before the strategist plans.",
+    output_key="preprocessing_research_output",
+    instruction="""You are the Preprocessing Research Agent — the FIRST agent in the preprocessing pipeline.
+
+PIPELINE CONTEXT
+You live inside a SequentialAgent:
+  [You] → Dataset Analyzer → Preprocessing Strategist → Executor Loop → Report Generator
+
+The Preprocessing Strategist reads your findings from pipeline_state.json immediately after you.
+Your job: give it PRECISE, EVIDENCE-BACKED technique choices so it produces a better plan.
+
+YOUR TASK
+
+1. Call get_project_context() to load the user goal, selected dataset, and data profile.
+
+2. Search for the RIGHT techniques for THIS specific dataset:
+
+   MISSING VALUES — search: 'best imputation <data_type> sklearn 2025'
+   • Numeric: median (robust to outliers) or KNNImputer for correlated cols
+   • Categorical: mode or add a 'Missing' category
+   • >30% missing: consider dropping the column entirely
+
+   CATEGORICAL ENCODING — search: 'encoding high cardinality categorical sklearn 2025'
+   • <15 unique values: OneHotEncoder (watch out for feature explosion)
+   • >50 unique values: OrdinalEncoder for tree models; TargetEncoder for linear models
+   • NEVER use LabelEncoder on features for linear models
+
+   SCALING — search: 'feature scaling sklearn StandardScaler RobustScaler when to use'
+   • Tree models (RF, XGBoost, LightGBM): NO scaling needed
+   • Linear / KNN / SVM / Neural: StandardScaler or RobustScaler (if outliers)
+   • Skewed distributions: PowerTransformer(method='yeo-johnson')
+
+   TEXT COLUMNS — search: 'TfidfVectorizer sklearn parameters best practices 2025'
+   DATETIME — search: 'pandas datetime feature extraction ML 2025'
+   CLASS IMBALANCE — search: 'SMOTE imbalanced-learn sklearn 2025 pipeline'
+
+3. Verify API correctness with search:
+   • 'pandas 2.0 breaking changes fillna inplace'
+   • 'sklearn 1.4 ColumnTransformer Pipeline correct usage'
+   Use Google Search or Tavily — do NOT rely on training data for API details.
+
+4. Call _pp_save_research() with all fields filled with SPECIFIC recommendations.
+   step_order must list every step in sequence.
+   library_api_notes must include actual function names and parameters.
+
+RULES
+- Every recommendation must match the actual data types found in the dataset
+- Cite the search source for any non-obvious technique choice
+- The Strategist will follow your step_order directly — make it complete
+""",
+    tools=_pp_research_tools,
+)
+
+
+# ============================================================
 # ==================  ROOT ORCHESTRATOR  =====================
 # ============================================================
 data_preprocessing_agent = SequentialAgent(
     name="data_preprocessing_orchestrator",
-    description="Orchestrates the full data preprocessing pipeline: dataset selection → planning → execution+validation loop → final report.",
+    description="Researches techniques then orchestrates: dataset selection → planning → execution+validation loop → report.",
     sub_agents=[
+        _preprocessing_research_agent,
         dataset_analyzer_agent,
         preprocessing_strategist_agent,
         code_gen_validation_loop,

@@ -54,7 +54,9 @@ def get_full_pipeline_context() -> str:
     """
     Load ALL available context from the pipeline — user goal, Q&A pairs,
     project report, selected dataset info, preprocessing plan and results,
-    and the path to the preprocessed dataset.
+    the path to the preprocessed dataset, and pre-phase research findings.
+    The ml_training_research field contains SOTA recommendations, hyperparameter
+    ranges, and library notes from the research agent that ran before this phase.
     Call this FIRST so you understand everything that has happened so far.
     Returns a JSON string with all relevant fields.
     """
@@ -69,27 +71,31 @@ def get_full_pipeline_context() -> str:
         "pipeline_checkpoints": state.get("pipeline_checkpoints", {}),
         "status": state.get("status", ""),
         "ml_plan": state.get("ml_plan", {}),
+        "ml_training_research": state.get("ml_training_research", {}),
     }
     return json.dumps(context, indent=2, default=str)
 
 
 def read_outputs_folder() -> str:
     """
-    Read all text/markdown/JSON files from this run's outputs/ folder.
-    Includes preprocessing reports, project reports, and any prior results.
+    Read all text/markdown/JSON files from this run's outputs/ folder and run dir.
+    Includes preprocessing reports, project reports, ML metrics, and any prior results.
     Use this to understand the full picture of work done so far.
-    Returns a JSON object mapping filename to content (first 8000 chars each).
+    Returns a JSON object mapping relative path to content (first 8000 chars each).
     """
     outputs_dir = get_outputs_dir()
+    run_dir = get_run_dir()
     files = {}
-    for f in sorted(outputs_dir.rglob("*")):
-        if f.is_file() and f.suffix in {".txt", ".md", ".json", ".log", ".csv"}:
-            try:
-                files[f.name] = f.read_text(encoding="utf-8", errors="ignore")[:8000]
-            except Exception as e:
-                files[f.name] = f"[Read error: {e}]"
+    for search_dir in [outputs_dir, run_dir]:
+        for f in sorted(search_dir.rglob("*")):
+            if f.is_file() and f.suffix in {".txt", ".md", ".json", ".log", ".csv"}:
+                try:
+                    key = str(f.relative_to(PROJECT_ROOT))
+                    files[key] = f.read_text(encoding="utf-8", errors="ignore")[:8000]
+                except Exception as e:
+                    files[str(f)] = f"[Read error: {e}]"
     if not files:
-        return json.dumps({"message": "No output files found yet in outputs/."})
+        return json.dumps({"message": "No output files found yet."})
     return json.dumps(files, indent=2)
 
 
@@ -445,16 +451,31 @@ def get_ml_plan_for_trainer() -> str:
 
 def get_ml_outputs_dir() -> str:
     """
-    Return the absolute path where trained models and plots should be saved.
+    Return the path where trained models and plots should be saved.
     Creates the directory if it does not exist.
-    All model .joblib files and plot .png files should go here.
+
+    Two paths are returned:
+    - ml_outputs_dir: HOST path (Windows absolute). Use when calling
+      save_training_results(), mark_training_complete(), or any host-side tool.
+    - sandbox_ml_outputs_dir: path INSIDE Docker (/workspace/ml_outputs).
+      Use as ML_OUTPUTS_DIR in scripts passed to run_in_sandbox().
+
+    The sandbox mounts the run dir as /workspace, so /workspace/ml_outputs
+    is the only reliable absolute path inside Linux containers. Passing the
+    Windows host path into Docker creates a malformed directory name because
+    backslash is not a path separator on Linux.
     """
-    outputs_dir = get_outputs_dir()
-    ml_outputs_dir = outputs_dir / "ml_outputs"
+    run_dir = get_run_dir()
+    ml_outputs_dir = run_dir / "ml_outputs"
     ml_outputs_dir.mkdir(parents=True, exist_ok=True)
     return json.dumps({
         "ml_outputs_dir": str(ml_outputs_dir),
-        "outputs_dir": str(outputs_dir),
+        "sandbox_ml_outputs_dir": "/workspace/ml_outputs",
+        "note": (
+            "In sandbox scripts (run_in_sandbox), set ML_OUTPUTS_DIR = '/workspace/ml_outputs'. "
+            "When calling save_training_results() or mark_training_complete(), use ml_outputs_dir "
+            "(translate '/workspace/ml_outputs/X' -> ml_outputs_dir + '/X' for the host path)."
+        ),
     })
 
 
@@ -582,21 +603,26 @@ def read_all_ml_outputs() -> str:
     }
 
     outputs_dir = get_outputs_dir()
-    for f in sorted(outputs_dir.rglob("*")):
-        if not f.is_file():
-            continue
-        rel = str(f.relative_to(PROJECT_ROOT))
-        if f.suffix in {".txt", ".md", ".json", ".log"}:
+    run_dir = get_run_dir()
+    for search_dir in [outputs_dir, run_dir]:
+        for f in sorted(search_dir.rglob("*")):
+            if not f.is_file():
+                continue
             try:
-                summary["output_files"][rel] = f.read_text(
-                    encoding="utf-8", errors="ignore"
-                )[:6000]
-            except Exception as e:
-                summary["output_files"][rel] = f"[Read error: {e}]"
-        elif f.suffix in {".png", ".jpg", ".csv", ".joblib", ".pkl"}:
-            summary["output_files"][rel] = (
-                f"[Binary/data file — {f.suffix} — {f.stat().st_size} bytes]"
-            )
+                rel = str(f.relative_to(PROJECT_ROOT))
+            except ValueError:
+                rel = str(f)
+            if f.suffix in {".txt", ".md", ".json", ".log"}:
+                try:
+                    summary["output_files"][rel] = f.read_text(
+                        encoding="utf-8", errors="ignore"
+                    )[:6000]
+                except Exception as e:
+                    summary["output_files"][rel] = f"[Read error: {e}]"
+            elif f.suffix in {".png", ".jpg", ".csv", ".joblib", ".pkl"}:
+                summary["output_files"][rel] = (
+                    f"[Binary/data file — {f.suffix} — {f.stat().st_size} bytes]"
+                )
 
     return json.dumps(summary, indent=2, default=str)
 
@@ -788,8 +814,22 @@ WORKFLOW:
                                       mean_squared_error, r2_score, roc_auc_score)
         warnings.filterwarnings('ignore')
 
+      PATH CRITICAL — read carefully:
+        get_ml_outputs_dir() returns TWO paths:
+          "sandbox_ml_outputs_dir": "/workspace/ml_outputs"   ← USE THIS in sandbox scripts
+          "ml_outputs_dir": "C:\\...\\modified_datasets\\...\\ml_outputs"  ← USE THIS for host tools
+
+        In every training script that runs via run_in_sandbox(), set:
+            ML_OUTPUTS_DIR = '/workspace/ml_outputs'
+        NEVER use the Windows path (ml_outputs_dir) inside sandbox scripts.
+        On Linux the backslash-separated Windows path is treated as a single
+        filename component, creating a directory named 'C:\\...' inside /workspace.
+
       REQUIRED logic:
-        - Load the preprocessed CSV from the exact path in the plan
+        - At the top of every training script:
+            ML_OUTPUTS_DIR = '/workspace/ml_outputs'
+            import os; os.makedirs(ML_OUTPUTS_DIR, exist_ok=True)
+        - Load the preprocessed CSV — use /workspace/<filename>.csv for files in the run dir
         - Split 80/10/10 with random_state=42
         - Train the model
         - 5-fold cross-validation and print all scores
@@ -798,25 +838,27 @@ WORKFLOW:
         - Feature importance PNG if model supports it (tree-based models)
         - Save model:
             # joblib is safe here — models are saved by this pipeline and loaded
-            # only within the same run from our own outputs/ml_outputs/ directory.
+            # only within the same run from our own ml_outputs/ directory.
             # Never load joblib files from untrusted / external sources.
-            joblib.dump(model, Path(ML_OUTPUTS_DIR) / 'ModelName.joblib')
-        - Save metrics: json.dump(metrics, open(Path(ML_OUTPUTS_DIR) / 'metrics_ModelName.json','w'))
+            joblib.dump(model, os.path.join(ML_OUTPUTS_DIR, 'ModelName.joblib'))
+        - Save metrics: json.dump(metrics, open(os.path.join(ML_OUTPUTS_DIR, 'metrics_ModelName.json'),'w'))
         - Print a clear metrics summary at the end
-
-      Use the exact ML_OUTPUTS_DIR string returned by get_ml_outputs_dir().
 
    b. Call write_file_to_sandbox('train_ModelName.py', script_code)
    c. Call run_in_sandbox('python train_ModelName.py')
    d. If execution fails, examine the error, fix it, and retry ONCE before moving on.
-   e. Call save_training_results() with the model's metrics and file paths.
+   e. Call save_training_results() — for model_file_path use the HOST path:
+        host_ml_outputs_dir + '/ModelName.joblib'
+      where host_ml_outputs_dir is the 'ml_outputs_dir' field from get_ml_outputs_dir().
 
 5. Write and run a comparison script that:
+   - Sets ML_OUTPUTS_DIR = '/workspace/ml_outputs'
    - Reads all metrics_*.json files from ML_OUTPUTS_DIR
    - Ranks models by the primary metric from the plan
-   - Saves: Path(ML_OUTPUTS_DIR) / 'model_comparison.csv'
+   - Saves: os.path.join(ML_OUTPUTS_DIR, 'model_comparison.csv')
 
 6. Call mark_training_complete() with the best model details.
+   For best_model_path use the HOST path: ml_outputs_dir + '/ModelName.joblib'
 7. Call stop_sandbox() to free resources.
 
 CODE REQUIREMENTS:
@@ -824,7 +866,7 @@ CODE REQUIREMENTS:
 - Always matplotlib.use('Agg') before any other matplotlib operation
 - Save models with joblib.dump, never pickle
 - Wrap each model block in try/except so one failure does not stop others
-- Do not hardcode paths — use the ML_OUTPUTS_DIR string from get_ml_outputs_dir()
+- In sandbox scripts always use sandbox_ml_outputs_dir ('/workspace/ml_outputs'), never the Windows ml_outputs_dir
 
 COLAB LIFECYCLE (GPU sessions cost free quota — manage carefully):
 - For standard ML (scikit-learn, XGBoost, LightGBM): use local Docker sandbox only. Do NOT start Colab.
@@ -946,14 +988,150 @@ RULES:
 )
 
 
+# ---- ML Research Agent (runs first, scoped to this pipeline) ----------------
+
+from tavily import TavilyClient as _TavilyClient
+_tavily_ml = _TavilyClient(api_key=os.getenv("TAVILY_API_KEY", ""))
+
+
+
+def _ml_search(query: str, domain_filter: str = "all") -> str:
+    """
+    Search for SOTA models, hyperparameters, benchmarks, and evaluation best practices.
+
+    Args:
+        query: e.g. 'XGBoost hyperparameter tuning tabular classification 2025'
+        domain_filter: comma-separated domains or 'all'.
+            e.g. 'paperswithcode.com,arxiv.org' or 'xgboost.readthedocs.io'
+    Returns:
+        JSON list with title, url, snippet per result.
+    """
+    try:
+        kwargs: dict = {"query": query, "search_depth": "advanced", "max_results": 5}
+        if domain_filter and domain_filter.lower() != "all":
+            kwargs["include_domains"] = [d.strip() for d in domain_filter.split(",")]
+        resp = _tavily_ml.search(**kwargs)
+        return json.dumps([
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")[:600]}
+            for r in resp.get("results", [])
+        ], indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _ml_save_research(
+    problem_type: str,
+    ranked_models: str,
+    hyperparameter_ranges: str,
+    evaluation_strategy: str,
+    sota_benchmarks: str,
+    training_tips: str,
+    warnings: str,
+) -> str:
+    """
+    Save ML research so the Strategy Planner (next agent) uses it immediately.
+
+    Args:
+        problem_type: Confirmed type with evidence (e.g. 'binary classification, imbalanced 80/20').
+        ranked_models: Models ranked by expected fit, each with one-line justification.
+        hyperparameter_ranges: Specific numeric ranges per model
+            (e.g. 'XGBoost: n_estimators=100-1000, max_depth=3-8, lr=0.01-0.3').
+        evaluation_strategy: Metric, CV method, split ratios
+            (e.g. 'AUC-ROC primary; StratifiedKFold(5); 80/10/10 split').
+        sota_benchmarks: Real performance targets from papers or competitions.
+        training_tips: Code-level tips for the trainer
+            (e.g. 'set early_stopping_rounds=50; use scale_pos_weight for imbalance').
+        warnings: Overfitting risks, metric pitfalls, leakage risks.
+    Returns:
+        Confirmation JSON.
+    """
+    save_state({
+        "ml_training_research": {
+            "problem_type": problem_type,
+            "ranked_models": ranked_models,
+            "hyperparameter_ranges": hyperparameter_ranges,
+            "evaluation_strategy": evaluation_strategy,
+            "sota_benchmarks": sota_benchmarks,
+            "training_tips": training_tips,
+            "warnings": warnings,
+        }
+    })
+    return json.dumps({"status": "saved"}, indent=2)
+
+
+_ml_research_tools = [get_full_pipeline_context, _ml_search, _ml_save_research]
+try:
+    from mcp_servers.mcp_servers import tavily_mcp as _ml_tavily_mcp
+    _ml_research_tools.append(_ml_tavily_mcp)
+except Exception:
+    pass
+
+_ml_research_agent = Agent(
+    model="gemini-3.1-flash-lite",
+    name="ml_research_agent",
+    description="Researches SOTA models, hyperparameters, and evaluation strategies before the strategy planner runs.",
+    output_key="ml_research_output",
+    instruction="""You are the ML Research Agent — the FIRST agent in the ML training pipeline.
+
+PIPELINE CONTEXT
+You live inside a SequentialAgent:
+  [You] → ML Strategy Planner → ML Model Trainer → ML Report Writer
+
+The ML Strategy Planner reads your findings from pipeline_state.json immediately after you.
+Give it SPECIFIC numbers and ranked recommendations — it will build the training plan from them.
+
+YOUR TASK
+
+1. Call get_full_pipeline_context() to load the full project state, preprocessed data profile,
+   and user constraints (compute, timeline, skill level from qa_pairs).
+
+2. Confirm the exact problem type from the preprocessed dataset:
+   • Binary / multi-class classification vs regression vs clustering vs time-series
+   • Dataset size and dimensionality (affects model capacity)
+   • Class balance ratio (critical for metric and strategy choice)
+
+3. Research SOTA for this exact task — use ALL available search tools:
+   _ml_search('state of the art <problem_type> <domain> 2025 benchmark', domain_filter='paperswithcode.com,arxiv.org')
+   _ml_search('best model tabular <task> kaggle winning solution 2024 2025')
+   Google Search: 'site:paperswithcode.com <task> <domain> leaderboard'
+
+4. Research hyperparameters for the top 3-5 candidate models:
+   _ml_search('XGBoostClassifier best hyperparameters <task> 2025 optuna')
+   _ml_search('LightGBM num_leaves learning_rate tuning tabular 2025')
+   _ml_search('sklearn RandomForestClassifier hyperparameter grid 2025')
+   Find ACTUAL NUMERIC RANGES — not vague guidance.
+
+5. Research evaluation best practices:
+   _ml_search('evaluation metrics <problem_type> sklearn pitfalls 2025')
+   • Which metric is correct for this task and class distribution?
+   • StratifiedKFold vs KFold vs TimeSeriesSplit?
+   • Common mistakes (e.g. accuracy on imbalanced data, AUC vs F1 trade-off)
+
+6. Call _ml_save_research() with ALL fields:
+   • ranked_models: ordered list with one-line evidence per model
+   • hyperparameter_ranges: NUMBERS (e.g. 'max_depth: 3-10, lr: 0.01-0.3')
+   • evaluation_strategy: exact metric name, CV method, n_splits
+   • training_tips: code-level instructions the trainer agent can use directly
+
+RULES
+- Hyperparameter ranges must be numeric — never 'tune appropriately'
+- Every model ranking must cite a reason tied to THIS dataset's characteristics
+- Use search to get 2024/2025 info — your training data may be outdated
+- sota_benchmarks must be real numbers from actual papers or Kaggle leaderboards
+""",
+    tools=_ml_research_tools,
+)
+
+
 # ---- Root Sequential Agent ----
 root_agent = SequentialAgent(
     name="ml_pipeline_agent",
     description=(
         "End-to-end ML pipeline: "
-        "strategy planning → model training → final report generation."
+        "research → strategy planning → model training → final report generation."
     ),
     sub_agents=[
+        _ml_research_agent,
         ml_strategy_planner,
         ml_model_trainer,
         ml_report_writer,

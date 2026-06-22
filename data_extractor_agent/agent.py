@@ -169,17 +169,18 @@ def download_huggingface_dataset(dataset_name: str) -> str:
 
 def get_dataset_requirements() -> str:
     """
-    Load the user's report and goal from pipeline_state.json.
-    This gives the agent context for what datasets to search for.
+    Load the user's report, goal, and pre-phase research context from pipeline_state.json.
+    This gives the agent full context — including research-backed dataset recommendations.
 
     Returns:
-        JSON string with the user's goal and report.
+        JSON string with user goal, report, and dataset_search_research findings.
     """
     state = load_state()
     requirements = {
         "user_goal": state.get("user_goal", ""),
         "report": state.get("report", "")[:5000] if state.get("report") else "",
         "status": state.get("status", ""),
+        "dataset_search_research": state.get("dataset_search_research", {}),
     }
     return json.dumps(requirements, indent=2)
 
@@ -188,37 +189,158 @@ def get_dataset_requirements() -> str:
 # AGENT DEFINITION
 # ============================================================
 
-from google.adk.agents import Agent
+from google.adk.agents import Agent, SequentialAgent
 
-dataset_extractor_agent = Agent(
+
+# ── Dataset Research Agent (embedded — runs first in this pipeline) ──────────
+
+def _save_dataset_research(
+    primary_source: str,
+    recommended_ids: str,
+    search_queries: str,
+    source_reasoning: str,
+    warnings: str,
+) -> str:
+    """
+    Save dataset research findings so the extractor agent (next in pipeline) uses them.
+
+    Args:
+        primary_source: 'kaggle' or 'huggingface' — which to search first
+        recommended_ids: Specific dataset IDs to try (one per line).
+            Kaggle format: 'username/dataset-name'. HF format: 'org/dataset-name'
+        search_queries: Best queries for the extractor to fall back on (one per line)
+        source_reasoning: Why this source was chosen for this task type
+        warnings: Licensing issues, size limitations, or quality caveats
+    Returns:
+        Confirmation JSON.
+    """
+    save_state({
+        "dataset_search_research": {
+            "primary_source": primary_source,
+            "recommended_ids": recommended_ids,
+            "search_queries": search_queries,
+            "source_reasoning": source_reasoning,
+            "warnings": warnings,
+        }
+    })
+    return json.dumps({"status": "saved"}, indent=2)
+
+
+_research_tools = [get_dataset_requirements, search_datasets, _save_dataset_research]
+
+_dataset_research_agent = Agent(
     model="gemini-3.1-flash-lite",
-    name="dataset_extractor_agent",
+    name="dataset_research_agent",
+    description="Researches the best datasets and download sources before the extractor runs.",
+    output_key="dataset_research_output",
+    instruction="""You are the Dataset Research Agent — the FIRST agent in the data extraction pipeline.
+
+PIPELINE CONTEXT
+You live inside a SequentialAgent:
+  [You] dataset_research_agent → dataset_extractor_agent
+
+The dataset_extractor_agent runs IMMEDIATELY after you and reads your findings
+from pipeline_state.json. Give it SPECIFIC, ACTIONABLE intelligence — exact
+dataset IDs it can download without any further searching.
+
+YOUR TASK
+1. Call get_dataset_requirements() to load the user's goal, report, and ML task type.
+
+2. Determine the primary dataset source based on task type:
+   • NLP / text (sentiment, classification, NER, QA, translation) → HuggingFace first
+   • Tabular / CSV / structured (regression, classification with numeric features) → Kaggle first
+   • Computer vision / images → both; Kaggle for competition sets, HF for benchmarks
+   • Time-series / financial / sensor → Kaggle first
+   • Multi-modal → HuggingFace first
+
+3. Search for SPECIFIC dataset IDs using all available tools:
+   • Use search_datasets() with targeted queries like '<task> <domain> dataset 2024'
+   • Use Google Search (if available) for: 'site:kaggle.com/datasets <task>'
+     or 'site:huggingface.co/datasets <task>'
+   • Find REAL identifiers — not vague suggestions
+
+4. Call _save_dataset_research() with:
+   • primary_source: 'kaggle' or 'huggingface'
+   • recommended_ids: At least 3 specific IDs the extractor should try first
+   • search_queries: 2-3 fallback queries if IDs fail
+   • source_reasoning: One sentence justifying the source choice
+   • warnings: Any known quality/license issues
+
+RULES
+- Never make up dataset IDs — verify them with search
+- Be specific: 'datasnaek/youtube-new' not 'youtube dataset on kaggle'
+- The extractor trusts your IDs and tries them directly
+""",
+    tools=_research_tools,
+)
+
+# ── HuggingFace MCP (optional, adds richer HF search to extractor) ──────────
+_hf_mcp = None
+try:
+    from mcp_servers.mcp_servers import hugging_face_mcp as _hf_mcp_obj
+    _hf_mcp = _hf_mcp_obj
+except Exception:
+    pass
+
+_extractor_tools = [
+    get_dataset_requirements,
+    search_datasets,
+    download_kaggle_dataset,
+    download_huggingface_dataset,
+]
+if _hf_mcp is not None:
+    _extractor_tools.append(_hf_mcp)
+
+_dataset_extractor_core = Agent(
+    model="gemini-3.1-flash-lite",
+    name="dataset_extractor_core",
     description="Searches Kaggle and HuggingFace for relevant datasets and downloads them.",
     instruction="""You are the Dataset Extractor Agent. Your task is to find and download the best datasets for the user's ML project.
 
 WORKFLOW:
 1. Call get_dataset_requirements to understand what the user needs.
-2. Use search_datasets to find relevant datasets on Kaggle or HuggingFace.
-3. Analyze the search results — pick the MOST relevant datasets (prefer Kaggle for tabular data).
-4. Download 1-3 of the best datasets using download_kaggle_dataset or download_huggingface_dataset.
-5. Respond with a summary of what was downloaded and where.
+   - READ the 'dataset_search_research' field — it contains pre-researched dataset recommendations.
+     If it lists specific dataset IDs, try those FIRST before doing a broad search.
+
+2. Determine the PRIMARY data source based on the ML task type from the report:
+   - NLP / text classification / sentiment / QA / translation → PRIMARY: HuggingFace
+     (use download_huggingface_dataset; fall back to Kaggle only if HF has nothing good)
+   - Tabular / structured / CSV / numeric / mixed → PRIMARY: Kaggle
+     (use download_kaggle_dataset; check HF too for benchmark tabular datasets)
+   - Image / audio / video / CV tasks → search BOTH; try Kaggle first (larger labeled sets)
+   - Time-series / financial / sensor data → PRIMARY: Kaggle; check HF for domain-specific series
+   - Multi-modal → PRIMARY: HuggingFace (better multi-modal dataset support)
+
+3. Use search_datasets to find relevant datasets on the primary source.
+   If HuggingFace MCP tools are available, use them for direct Hub searches with richer metadata.
+
+4. Analyze search results and pick the MOST relevant datasets (1-3).
+   Prefer datasets that:
+   - Match the task type exactly (not just the domain)
+   - Have clear labels / target columns
+   - Are actively maintained (recent uploads preferred)
+   - Have enough size for training (>1000 rows for tabular, >500 examples for NLP)
+
+5. Download chosen datasets using the appropriate downloader.
+   For Kaggle: extract 'username/dataset-name' from 'kaggle.com/datasets/username/dataset-name'
+   For HuggingFace: extract 'org/dataset-name' from 'huggingface.co/datasets/org/dataset-name'
+
+6. Respond with a clear summary of what was downloaded, from where, and why it fits the task.
 
 IMPORTANT:
-- Actually call the download functions with the exact dataset identifiers.
-- Extract dataset identifiers from URLs:
-  * For Kaggle: ONLY use URLs containing '/datasets/' (NOT '/code/')
-  * From 'kaggle.com/datasets/username/dataset-name' extract 'username/dataset-name'
-  * For HuggingFace: From 'huggingface.co/datasets/username/dataset-name' extract 'username/dataset-name'
-- Skip any results that are code notebooks or kernels (URLs with '/code/' or '/kernels/')
-- If no good datasets are found, try different search queries
-- Download at least 1 dataset, preferably 2-3 for Agent 1 to choose from
+- NEVER use URLs with '/code/' or '/kernels/' — those are notebooks, not datasets
+- If the primary source fails, try the secondary source before giving up
+- Download at least 1 dataset, preferably 2-3 for the preprocessing agent to choose from
+- Use any specific dataset IDs from 'dataset_search_research' as your first download attempts
 """,
-    tools=[
-        get_dataset_requirements,
-        search_datasets,
-        download_kaggle_dataset,
-        download_huggingface_dataset,
-    ],
+    tools=_extractor_tools,
+)
+
+# ── Final pipeline: research first, then download ────────────────────────────
+dataset_extractor_agent = SequentialAgent(
+    name="data_extraction_pipeline",
+    description="Researches best datasets then downloads them.",
+    sub_agents=[_dataset_research_agent, _dataset_extractor_core],
 )
 
 # For ADK compatibility (adk web / adk run)
