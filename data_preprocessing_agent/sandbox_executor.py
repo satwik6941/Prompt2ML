@@ -87,6 +87,9 @@ IMPORT_TO_PIP: dict[str, str] = {
     "torch": "torch",
     "tensorflow": "tensorflow",
     "keras": "keras",
+    "optuna": "optuna",
+    "shap": "shap",
+    "category_encoders": "category_encoders",
 }
 
 # Standard library modules — never attempt to pip-install these.
@@ -448,32 +451,62 @@ async def stop_sandbox() -> str:
     return json.dumps({"status": "sandbox_stopped"})
 
 
+def _is_shell_command(code: str) -> tuple[bool, str]:
+    """
+    Detect the pattern `python <filename>.py` (single-line, no source code).
+    Returns (True, filename) when the input is a shell-style invocation of a
+    workspace file rather than inline Python source.
+    """
+    stripped = code.strip()
+    if "\n" in stripped:
+        return False, ""
+    parts = stripped.split()
+    if len(parts) >= 2 and parts[0] in ("python", "python3") and parts[1].endswith(".py"):
+        return True, parts[1]
+    return False, ""
+
+
+def _exec_error_response(exec_exc: Exception) -> str:
+    """Return a standard error JSON for a failed container exec call."""
+    if _is_docker_daemon_error(exec_exc):
+        error_type = "docker_not_running"
+        action = "Start Docker Desktop and call start_sandbox() again."
+    else:
+        error_type = "execution_error"
+        action = "Check the code for syntax errors and try again."
+    print(f"[SANDBOX ERROR] exec failed ({error_type}): {exec_exc}", flush=True)
+    return json.dumps({
+        "success": False,
+        "stdout": "",
+        "stderr": str(exec_exc),
+        "error_type": error_type,
+        "action": action,
+    })
+
+
 async def run_in_sandbox(code: str) -> str:
     """
-    Execute Python code inside the sandbox container.
+    Execute Python code — or a pre-written workspace script — inside the sandbox.
 
-    Workflow:
-      1. Parse the code to find import statements.
-      2. Auto-install any missing pip packages into the running container.
-      3. Write the code to a uniquely-named temp file in /workspace on the host.
-      4. Execute it via `docker exec python /workspace/_exec_<uuid>.py`.
-      5. Delete the temp file.
-      6. Return JSON with success/failure and captured output.
+    Supports two calling styles:
 
-    The container's /workspace is the host's run-specific workspace folder.
-    Any CSV/JSON files already there are readable as:
-        pd.read_csv('/workspace/<filename>.csv')
-    Results saved to /workspace/ are immediately available on the host.
+    Style A — inline source code (preprocessing agents):
+        run_in_sandbox("import pandas as pd\\n...")
+        Writes a temp file and executes it.
+
+    Style B — run a file already written via write_file_to_sandbox (ML trainer):
+        run_in_sandbox("python train_RandomForest.py")
+        Runs /workspace/train_RandomForest.py directly.
+
+    Missing pip packages are auto-installed in both styles.
 
     Args:
-        code: Python source code to execute. Use /workspace/ paths for file I/O.
+        code: Python source code OR a single-line 'python <filename>.py' command.
 
     Returns:
         JSON {"success": true, "stdout": "..."} on success.
         JSON {"success": false, "stderr": "...", "error_type": "..."} on failure.
-        Always check the "success" key before using the output.
     """
-    # Normalise line endings — Docker exec sends the file as-is; keep it clean.
     code = code.replace("\r\n", "\n").replace("\r", "\n")
 
     if not _started or _container is None:
@@ -488,80 +521,86 @@ async def run_in_sandbox(code: str) -> str:
             ),
         })
 
-    # --- Auto-install missing dependencies ---
-    try:
-        imports = _parse_imports(code)
-        dep_result = _check_and_install_deps(imports)
-        if dep_result.get("installed"):
-            print(f"[SANDBOX] Auto-installed packages: {dep_result['installed']}", flush=True)
-    except Exception as dep_exc:
-        # Dependency check is best-effort — don't abort the run.
-        print(f"[SANDBOX WARNING] Dependency check failed: {dep_exc}", flush=True)
+    is_shell, filename = _is_shell_command(code)
 
-    # --- Write temp script to workspace ---
-    script_name = f"_exec_{uuid.uuid4().hex[:8]}.py"
-    script_host_path = Path(WORKSPACE) / script_name
-    try:
-        script_host_path.write_text(code, encoding="utf-8", newline="\n")
-    except Exception as write_exc:
-        return json.dumps({
-            "success": False,
-            "stdout": "",
-            "stderr": f"Failed to write temp script: {write_exc}",
-            "error_type": "io_error",
-            "action": f"Check that {WORKSPACE} is writable.",
-        })
+    if is_shell:
+        # Style B: file already in /workspace — run it directly.
+        host_path = Path(WORKSPACE) / filename
+        if not host_path.exists():
+            return json.dumps({
+                "success": False,
+                "stdout": "",
+                "stderr": (
+                    f"Script '{filename}' not found in workspace. "
+                    f"Call write_file_to_sandbox('{filename}', code) first."
+                ),
+                "error_type": "file_not_found",
+                "action": f"write_file_to_sandbox('{filename}', script_code)",
+            })
 
-    # --- Execute inside container ---
-    try:
-        exit_code, output = _exec_in_container(
-            ["python", f"/workspace/{script_name}"]
-        )
-    except Exception as exec_exc:
         try:
-            script_host_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        if _is_docker_daemon_error(exec_exc):
-            error_type = "docker_not_running"
-            action = "Start Docker Desktop and call start_sandbox() again."
-        else:
-            error_type = "execution_error"
-            action = "Check the code for syntax errors and try again."
-        print(f"[SANDBOX ERROR] run_in_sandbox exec failed ({error_type}): {exec_exc}", flush=True)
-        return json.dumps({
-            "success": False,
-            "stdout": "",
-            "stderr": str(exec_exc),
-            "error_type": error_type,
-            "action": action,
-        })
-    finally:
-        # Always remove temp script
-        try:
-            script_host_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            src = host_path.read_text(encoding="utf-8", errors="ignore")
+            dep_result = _check_and_install_deps(_parse_imports(src))
+            if dep_result.get("installed"):
+                print(f"[SANDBOX] Auto-installed: {dep_result['installed']}", flush=True)
+        except Exception as dep_exc:
+            print(f"[SANDBOX WARNING] Dependency check failed: {dep_exc}", flush=True)
 
-    # --- Return result ---
-    if exit_code == 0:
-        return json.dumps({
-            "success": True,
-            "stdout": output.strip(),
-        }, indent=2)
+        print(f"[SANDBOX] Running /workspace/{filename}", flush=True)
+        try:
+            exit_code, output = _exec_in_container(["python", f"/workspace/{filename}"])
+        except Exception as exec_exc:
+            return _exec_error_response(exec_exc)
+
     else:
-        print(f"[SANDBOX] Code exited with code {exit_code}. stderr:\n{output[-600:]}", flush=True)
-        return json.dumps({
-            "success": False,
-            "stdout": "",
-            "stderr": output.strip(),
-            "error_type": "execution_error",
-            "action": (
-                "Review the stderr output above, fix the code, and call run_in_sandbox again. "
-                "Common causes: wrong file paths (use /workspace/), missing return values, "
-                "or a package that needs to be installed."
-            ),
-        })
+        # Style A: inline source — write temp file, run, delete.
+        try:
+            dep_result = _check_and_install_deps(_parse_imports(code))
+            if dep_result.get("installed"):
+                print(f"[SANDBOX] Auto-installed packages: {dep_result['installed']}", flush=True)
+        except Exception as dep_exc:
+            print(f"[SANDBOX WARNING] Dependency check failed: {dep_exc}", flush=True)
+
+        script_name = f"_exec_{uuid.uuid4().hex[:8]}.py"
+        script_host_path = Path(WORKSPACE) / script_name
+        try:
+            script_host_path.write_text(code, encoding="utf-8", newline="\n")
+        except Exception as write_exc:
+            return json.dumps({
+                "success": False,
+                "stdout": "",
+                "stderr": f"Failed to write temp script: {write_exc}",
+                "error_type": "io_error",
+                "action": f"Check that {WORKSPACE} is writable.",
+            })
+
+        try:
+            exit_code, output = _exec_in_container(
+                ["python", f"/workspace/{script_name}"]
+            )
+        except Exception as exec_exc:
+            return _exec_error_response(exec_exc)
+        finally:
+            try:
+                script_host_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    if exit_code == 0:
+        return json.dumps({"success": True, "stdout": output.strip()}, indent=2)
+
+    print(f"[SANDBOX] Code exited {exit_code}. stderr:\n{output[-600:]}", flush=True)
+    return json.dumps({
+        "success": False,
+        "stdout": "",
+        "stderr": output.strip(),
+        "error_type": "execution_error",
+        "action": (
+            "Review the stderr above, fix the code, and call run_in_sandbox again. "
+            "Common causes: wrong file paths (use /workspace/), missing imports, "
+            "or a package that needs installing."
+        ),
+    })
 
 
 async def write_file_to_sandbox(filename: str, content: str) -> str:

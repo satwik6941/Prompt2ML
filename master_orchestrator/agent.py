@@ -34,7 +34,10 @@ from pipeline_state import load_state, save_state, reset_run_dir_cache, reset_ru
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3.1-flash-lite"
+from model_config import REASONING_MODEL
+
+# Requirement gathering drives everything downstream — use the reasoning tier.
+MODEL = REASONING_MODEL
 
 # Per-phase timeouts (seconds). Set to 0 to disable.
 PHASE2_TIMEOUT = 900   # 15 min — dataset search + download
@@ -50,7 +53,7 @@ def _write_crash_log(phase: str, error: Exception, context: dict = None) -> None
         "error_type": type(error).__name__,
         "error_message": str(error),
         "traceback": traceback.format_exc(),
-        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "context": context or {},
     }
     try:
@@ -723,6 +726,20 @@ async def run_pipeline():
             f"Run the complete ML pipeline for this project: {user_goal}\n\n"
             "Execute all three phases: planning, training, and reporting."
         )
+        # Preprocessing that exhausted its retries proceeds with warnings — the ML
+        # phase must know so it can double-check data quality and say so in reports.
+        if state.get("status") == "preprocessing_complete_with_warnings":
+            last_validation = (state.get("agent4_iterations") or [{}])[-1]
+            print("\n[PIPELINE] WARNING: preprocessing finished WITH WARNINGS — "
+                  "validation never fully passed. The ML phase will be told to treat "
+                  "the data with suspicion.", flush=True)
+            kickoff_message += (
+                "\n\nIMPORTANT: The preprocessing phase completed WITH WARNINGS — its "
+                "validator never gave a full PASS. Unresolved issues: "
+                f"{json.dumps(last_validation.get('issues_found', []))}. "
+                "Profile the dataset carefully before training, work around remaining "
+                "issues where possible, and state these caveats explicitly in the final report."
+            )
         print("\n[PIPELINE] Running ML pipeline (strategy → training → report)...\n", flush=True)
 
         response = None

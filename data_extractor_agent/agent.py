@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 sys.path.append(str(Path(__file__).parent.parent))
 from pipeline_state import load_state, save_state
+from model_config import LIGHT_MODEL
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 load_dotenv(Path(__file__).parent / ".env")
@@ -229,7 +230,7 @@ def _save_dataset_research(
 _research_tools = [get_dataset_requirements, search_datasets, _save_dataset_research]
 
 _dataset_research_agent = Agent(
-    model="gemini-3.1-flash-lite",
+    model=LIGHT_MODEL,
     name="dataset_research_agent",
     description="Researches the best datasets and download sources before the extractor runs.",
     output_key="dataset_research_output",
@@ -254,7 +255,7 @@ YOUR TASK
    • Multi-modal → HuggingFace first
 
 3. Search for SPECIFIC dataset IDs using all available tools:
-   • Use search_datasets() with targeted queries like '<task> <domain> dataset 2024'
+   • Use search_datasets() with targeted queries like '<task> <domain> dataset <current year>'
    • Use Google Search (if available) for: 'site:kaggle.com/datasets <task>'
      or 'site:huggingface.co/datasets <task>'
    • Find REAL identifiers — not vague suggestions
@@ -292,7 +293,7 @@ if _hf_mcp is not None:
     _extractor_tools.append(_hf_mcp)
 
 _dataset_extractor_core = Agent(
-    model="gemini-3.1-flash-lite",
+    model=LIGHT_MODEL,
     name="dataset_extractor_core",
     description="Searches Kaggle and HuggingFace for relevant datasets and downloads them.",
     instruction="""You are the Dataset Extractor Agent. Your task is to find and download the best datasets for the user's ML project.

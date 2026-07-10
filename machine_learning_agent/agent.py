@@ -42,13 +42,30 @@ load_dotenv(Path(__file__).parent / ".env")
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3.1-flash-lite"
+from model_config import CODING_MODEL, REASONING_MODEL, LIGHT_MODEL
 
 
 # ============================================================
 # ==================  AGENT 1 TOOLS  =========================
 # ML Strategy Planner
 # ============================================================
+
+def _latest_preprocessing_plan(state: dict) -> dict:
+    """
+    Resolve the preprocessing plan from pipeline state.
+    The preprocessing agent stores it under agent2_output (a list of
+    {'preprocessing_plan': {...}} entries) — the old flat 'preprocessing_plan'
+    key was never populated, which left the ML agents planless.
+    """
+    a2 = state.get("agent2_output", [])
+    if isinstance(a2, list):
+        a2 = a2[-1] if a2 else {}
+    if isinstance(a2, dict):
+        plan = a2.get("preprocessing_plan", {})
+        if plan:
+            return plan
+    return state.get("preprocessing_plan", {}) or {}
+
 
 def get_full_pipeline_context() -> str:
     """
@@ -66,7 +83,7 @@ def get_full_pipeline_context() -> str:
         "qa_pairs": state.get("qa_pairs", []),
         "project_report_summary": (state.get("report") or "")[:5000],
         "selected_dataset": state.get("selected_dataset", {}),
-        "preprocessing_plan": state.get("preprocessing_plan", {}),
+        "preprocessing_plan": _latest_preprocessing_plan(state),
         "preprocessed_dataset_path": state.get("preprocessed_dataset_path", ""),
         "pipeline_checkpoints": state.get("pipeline_checkpoints", {}),
         "status": state.get("status", ""),
@@ -88,12 +105,18 @@ def read_outputs_folder() -> str:
     files = {}
     for search_dir in [outputs_dir, run_dir]:
         for f in sorted(search_dir.rglob("*")):
-            if f.is_file() and f.suffix in {".txt", ".md", ".json", ".log", ".csv"}:
+            if not f.is_file():
+                continue
+            key = str(f.relative_to(PROJECT_ROOT)) if f.is_relative_to(PROJECT_ROOT) else str(f)
+            if f.suffix in {".txt", ".md", ".json", ".log"}:
                 try:
-                    key = str(f.relative_to(PROJECT_ROOT))
                     files[key] = f.read_text(encoding="utf-8", errors="ignore")[:8000]
                 except Exception as e:
-                    files[str(f)] = f"[Read error: {e}]"
+                    files[key] = f"[Read error: {e}]"
+            elif f.suffix in {".csv", ".parquet"}:
+                # Never inline raw data files into the prompt — they blow up the
+                # context window. The data profile tool covers their content.
+                files[key] = f"[Data file — {f.suffix} — {f.stat().st_size} bytes]"
     if not files:
         return json.dumps({"message": "No output files found yet."})
     return json.dumps(files, indent=2)
@@ -219,7 +242,7 @@ def save_ml_training_plan(
         "advanced_models": advanced_models,
         "training_approach": training_approach,
         "plan_file": str(plan_path),
-        "created_at": datetime.datetime.utcnow().isoformat(),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
     save_state({
@@ -253,19 +276,19 @@ try:
         read_file_from_sandbox,
     )
 except ImportError:
-    def start_sandbox() -> str:
+    async def start_sandbox() -> str:
         return json.dumps({"error": "sandbox_executor not found. Docker sandbox unavailable."})
 
-    def stop_sandbox() -> str:
+    async def stop_sandbox() -> str:
         return json.dumps({"status": "no-op"})
 
-    def run_in_sandbox(code: str) -> str:
+    async def run_in_sandbox(code: str) -> str:
         return json.dumps({"error": "sandbox_executor not found."})
 
-    def write_file_to_sandbox(filename: str, content: str) -> str:
+    async def write_file_to_sandbox(filename: str, content: str) -> str:
         return json.dumps({"error": "sandbox_executor not found."})
 
-    def read_file_from_sandbox(filename: str) -> str:
+    async def read_file_from_sandbox(filename: str) -> str:
         return json.dumps({"error": "sandbox_executor not found."})
 
 
@@ -371,11 +394,14 @@ def start_colab_runtime() -> str:
 
 def stop_colab_runtime() -> str:
     """
-    Shut down the Colab runtime to free GPU hours, then terminate the local
-    colab-mcp bridge process. Call this AFTER all GPU training is complete.
+    Terminate the local colab-mcp bridge process. Call this AFTER all GPU
+    training is complete.
 
-    This is important — Colab GPU sessions count against your free quota even
-    when idle. Always call this when training is finished.
+    IMPORTANT: this function does NOT unassign the remote Colab runtime by
+    itself — it writes a shutdown snippet to the run dir. To actually free the
+    GPU session (idle sessions still drain the free quota), FIRST run
+    'from google.colab import runtime; runtime.unassign()' as a Colab cell via
+    the colab_mcp execute_code tool, THEN call this function to kill the bridge.
 
     Returns:
         JSON confirmation.
@@ -443,6 +469,15 @@ def get_ml_plan_for_trainer() -> str:
         "ml_plan": state.get("ml_plan", {}),
         "ml_plan_content": state.get("ml_plan_content", ""),
         "preprocessed_dataset_path": state.get("preprocessed_dataset_path", ""),
+        "preprocessing_plan": _latest_preprocessing_plan(state),
+        "deferred_transforms_note": (
+            "The preprocessed dataset is intentionally UNSCALED and any "
+            "'target_encode_deferred' columns are un-encoded. Apply the plan's "
+            "scaling_strategy / deferred target encoding INSIDE your sklearn "
+            "Pipeline so they fit on training data only."
+        ),
+        "ml_validation_feedback": state.get("ml_validation_feedback", ""),
+        "ml_validation_iterations": state.get("ml_validation_iterations", []),
         "user_goal": state.get("user_goal", ""),
         "status": state.get("status", ""),
         "colab_mcp_available": _COLAB_MCP_AVAILABLE,
@@ -522,7 +557,7 @@ def save_training_results(
         "training_summary": training_summary,
         "best_params": best_params,
         "feature_importance": feature_importance,
-        "saved_at": datetime.datetime.utcnow().isoformat(),
+        "saved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     })
 
     save_state({
@@ -572,6 +607,191 @@ def mark_training_complete(
 
 
 # ============================================================
+# ==================  ML VALIDATOR TOOLS  ====================
+# ============================================================
+
+# Higher-better metrics eligible for perfect-score and train/test-gap checks.
+_GAP_METRIC_KEYS = ("accuracy", "f1", "auc", "roc_auc", "r2", "precision", "recall", "balanced_accuracy")
+
+
+def _is_gap_metric(key: str) -> bool:
+    k = key.lower()
+    return any(m in k for m in _GAP_METRIC_KEYS)
+
+
+def validate_ml_results() -> str:
+    """
+    Programmatically audit the training artifacts on disk — do NOT trust the
+    trainer's self-report. Reads every metrics_*.json in ml_outputs/ and checks:
+
+      - artifacts: matching .joblib model file exists, model_comparison.csv exists,
+        at least one plot .png exists
+      - metrics shape: both 'train' and 'test' metric blocks present
+      - leakage signature: any test metric (accuracy/F1/AUC/R2/...) >= 0.995
+      - overfitting signature: train-test gap > 0.15 on any higher-better metric
+      - CV instability: cv_std > 0.5 * |cv_mean|
+
+    Returns a JSON checklist with per-model findings and an overall summary.
+    Suspicious findings are evidence for a FAIL verdict with specific feedback.
+    """
+    run_dir = get_run_dir()
+    ml_outputs = run_dir / "ml_outputs"
+
+    if not ml_outputs.exists():
+        return json.dumps({
+            "error": f"ml_outputs directory not found: {ml_outputs}",
+            "hint": "The trainer has not produced any artifacts yet.",
+        }, indent=2)
+
+    metrics_files = sorted(ml_outputs.glob("metrics_*.json"))
+    if not metrics_files:
+        return json.dumps({
+            "error": "No metrics_*.json files found in ml_outputs/.",
+            "files_present": [f.name for f in sorted(ml_outputs.iterdir())][:50],
+        }, indent=2)
+
+    findings = {}
+    suspicious_total = 0
+
+    for mf in metrics_files:
+        model_name = mf.stem.replace("metrics_", "")
+        check: dict = {"metrics_file": mf.name, "issues": [], "warnings": []}
+
+        try:
+            metrics = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception as e:
+            check["issues"].append(f"metrics file unreadable: {e}")
+            findings[model_name] = check
+            suspicious_total += 1
+            continue
+
+        # --- artifact presence ---
+        model_file = ml_outputs / f"{model_name}.joblib"
+        check["model_file_exists"] = model_file.exists()
+        if not model_file.exists():
+            check["issues"].append(f"model file missing: {model_file.name}")
+
+        # --- metrics shape ---
+        train = metrics.get("train") if isinstance(metrics.get("train"), dict) else None
+        test = metrics.get("test") if isinstance(metrics.get("test"), dict) else None
+        if test is None:
+            # tolerate legacy flat metric dicts, but flag them
+            test = {k: v for k, v in metrics.items() if isinstance(v, (int, float))}
+            check["warnings"].append(
+                "metrics JSON has no 'test' block — using flat keys; "
+                "trainer should save {'train': {...}, 'test': {...}, 'cv_mean', 'cv_std'}"
+            )
+        if train is None:
+            check["warnings"].append("no 'train' block — overfitting gap check impossible")
+
+        # --- leakage signature: suspiciously perfect test scores ---
+        perfect = {
+            k: v for k, v in (test or {}).items()
+            if _is_gap_metric(k) and isinstance(v, (int, float)) and v >= 0.995
+        }
+        if perfect:
+            check["issues"].append(
+                f"near-perfect test metrics {perfect} — classic data-leakage signature. "
+                "Check for leaked columns (IDs, post-outcome fields, duplicates across split)."
+            )
+
+        # --- overfitting signature: train vs test gap ---
+        if train and test:
+            gaps = {}
+            for k, v_test in test.items():
+                v_train = train.get(k)
+                if (_is_gap_metric(k) and isinstance(v_test, (int, float))
+                        and isinstance(v_train, (int, float))):
+                    gap = round(float(v_train) - float(v_test), 4)
+                    if gap > 0.15:
+                        gaps[k] = {"train": v_train, "test": v_test, "gap": gap}
+            if gaps:
+                check["issues"].append(
+                    f"large train-test gap {gaps} — overfitting. "
+                    "Constrain model capacity (max_depth, regularization) and retune."
+                )
+
+        # --- CV instability ---
+        cv_mean, cv_std = metrics.get("cv_mean"), metrics.get("cv_std")
+        if isinstance(cv_mean, (int, float)) and isinstance(cv_std, (int, float)):
+            if abs(cv_mean) > 0 and cv_std > 0.5 * abs(cv_mean):
+                check["warnings"].append(
+                    f"unstable CV: std {cv_std} vs mean {cv_mean} — results may not be reliable"
+                )
+        else:
+            check["warnings"].append("cv_mean/cv_std missing from metrics JSON")
+
+        if check["issues"]:
+            suspicious_total += 1
+        findings[model_name] = check
+
+    comparison_exists = (ml_outputs / "model_comparison.csv").exists()
+    plots = [f.name for f in ml_outputs.glob("*.png")]
+
+    return json.dumps({
+        "models_checked": len(metrics_files),
+        "models_with_issues": suspicious_total,
+        "model_comparison_csv_exists": comparison_exists,
+        "plots_found": plots,
+        "findings": findings,
+        "verdict_hint": (
+            "FAIL if any model has issues (leakage/overfit/missing artifacts) or "
+            "model_comparison.csv is missing; otherwise PASS."
+        ),
+    }, indent=2, default=str)
+
+
+def save_ml_validation_result(
+    verdict: str,
+    issues_found: str,
+    feedback_for_trainer: str,
+    quality_score: str,
+    validation_summary: str,
+) -> str:
+    """
+    Save the ML validation verdict to pipeline state.
+    If verdict is 'FAIL', the trainer retries with feedback_for_trainer.
+    If verdict is 'PASS', the training loop finishes.
+
+    Args:
+        verdict: 'PASS' or 'FAIL'.
+        issues_found: Comma-separated list of issues (empty if PASS).
+        feedback_for_trainer: Specific, actionable fix instructions (empty if PASS).
+            Name the exact model, the exact problem, and the exact fix.
+        quality_score: 1-10 rating of the training run's rigor and results.
+        validation_summary: Paragraph summarizing the audit.
+
+    Returns:
+        JSON confirmation.
+    """
+    if verdict.upper() not in ("PASS", "FAIL"):
+        return json.dumps({"error": f"Invalid verdict '{verdict}'. Must be 'PASS' or 'FAIL'."}, indent=2)
+
+    state = load_state()
+    iteration = state.get("ml_loop_iteration", 0)
+    result = {
+        "iteration": iteration,
+        "verdict": verdict.upper(),
+        "issues_found": [i.strip() for i in issues_found.split(",") if i.strip()],
+        "feedback_for_trainer": feedback_for_trainer,
+        "quality_score": quality_score,
+        "validation_summary": validation_summary,
+    }
+
+    iterations = state.get("ml_validation_iterations", [])
+    iterations.append(result)
+
+    save_state({
+        "ml_validation_iterations": iterations,
+        "ml_validation_feedback": feedback_for_trainer if verdict.upper() == "FAIL" else "",
+        "ml_loop_iteration": iteration + 1,
+        "status": "ml_complete" if verdict.upper() == "PASS" else "ml_needs_retry",
+    })
+
+    return json.dumps({"status": "saved", "verdict": verdict.upper(), "quality_score": quality_score}, indent=2)
+
+
+# ============================================================
 # ==================  AGENT 3 TOOLS  =========================
 # ML Report Writer
 # ============================================================
@@ -587,6 +807,7 @@ def read_all_ml_outputs() -> str:
     state = load_state()
 
     summary = {
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "pipeline_state": {
             "user_goal": state.get("user_goal", ""),
             "status": state.get("status", ""),
@@ -598,6 +819,7 @@ def read_all_ml_outputs() -> str:
             "best_metrics": state.get("best_metrics", ""),
             "all_models_compared": state.get("all_models_compared", ""),
             "preprocessed_dataset_path": state.get("preprocessed_dataset_path", ""),
+            "ml_validation_iterations": state.get("ml_validation_iterations", []),
         },
         "output_files": {},
     }
@@ -680,11 +902,15 @@ def save_final_report(
 # ========  AGENT DEFINITIONS  ===============================
 # ============================================================
 
-from google.adk.agents import Agent, SequentialAgent
+from typing import AsyncGenerator
+
+from google.adk.agents import Agent, SequentialAgent, LoopAgent, BaseAgent
+from google.adk.events import Event, EventActions
+from google.adk.agents.invocation_context import InvocationContext
 
 # ---- Agent 1: ML Strategy Planner ----
 ml_strategy_planner = Agent(
-    model=MODEL,
+    model=REASONING_MODEL,
     name="ml_strategy_planner",
     description="Reads all prior pipeline outputs and drafts a comprehensive ML training plan.",
     output_key="ml_training_plan",
@@ -785,7 +1011,7 @@ if colab_mcp is not None:
     _trainer_tools.append(colab_mcp)
 
 ml_model_trainer = Agent(
-    model=MODEL,
+    model=CODING_MODEL,
     name="ml_model_trainer",
     description="Writes and executes ML training code; saves trained models and results.",
     output_key="ml_training_results",
@@ -809,7 +1035,12 @@ WORKFLOW:
         import matplotlib; matplotlib.use('Agg')
         import matplotlib.pyplot as plt
         from pathlib import Path
-        from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+        from sklearn.model_selection import (train_test_split, cross_val_score,
+                                             StratifiedKFold, TimeSeriesSplit,
+                                             RandomizedSearchCV)
+        from sklearn.pipeline import Pipeline
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, TargetEncoder
         from sklearn.metrics import (classification_report, confusion_matrix,
                                       mean_squared_error, r2_score, roc_auc_score)
         warnings.filterwarnings('ignore')
@@ -830,17 +1061,56 @@ WORKFLOW:
             ML_OUTPUTS_DIR = '/workspace/ml_outputs'
             import os; os.makedirs(ML_OUTPUTS_DIR, exist_ok=True)
         - Load the preprocessed CSV — use /workspace/<filename>.csv for files in the run dir
-        - Split 80/10/10 with random_state=42
-        - Train the model
-        - 5-fold cross-validation and print all scores
+
+        LEAKAGE-SAFE TRAINING (non-negotiable — this is what makes the metrics real):
+        - SPLIT FIRST, FIT LATER. Nothing that learns from data (scaler, encoder,
+          vectorizer, imputer, model) may be fit before the train/test split.
+        - The preprocessed dataset arrives UNSCALED on purpose. Build a sklearn
+          Pipeline: steps = [('scaler', <scaler from preprocessing_plan.scaling_strategy>),
+          ('model', <estimator>)]. Use ColumnTransformer when only some columns scale.
+          Tree models (RandomForest, XGBoost, LightGBM, CatBoost) need NO scaler —
+          pipeline is just [('model', ...)].
+        - Columns marked 'target_encode_deferred' in the plan: encode with sklearn's
+          TargetEncoder INSIDE the pipeline (via ColumnTransformer), never before the split.
+        - Raw text columns kept for the model: fit TfidfVectorizer inside the pipeline
+          (ColumnTransformer), never on the full dataset.
+        - All cross-validation must go through the Pipeline (cross_val_score(pipeline, ...))
+          so every fold re-fits its own transforms.
+
+        SPLIT STRATEGY (choose by problem type from the plan — never one-size-fits-all):
+        - time_series: chronological split (last 20% as test, NO shuffle) and
+          TimeSeriesSplit for CV. NEVER shuffle time-ordered data.
+        - classification: train_test_split(..., stratify=y, random_state=42) and
+          StratifiedKFold(5) for CV.
+        - regression / other: 80/20 split with random_state=42, KFold(5) CV.
+        - If an ID/group column exists that would leak across splits, use GroupKFold.
+
+        HYPERPARAMETER TUNING (required for advanced models — defaults are not a result):
+        - Baseline model: train with defaults only. This sets the performance floor.
+        - Each advanced model: tune with RandomizedSearchCV(pipeline, param_distributions,
+          n_iter=25, cv=<the CV splitter above>, scoring=<primary metric>, random_state=42)
+          — or Optuna (installed in the sandbox) with ~25 trials if the search space
+          benefits from pruning. Use the numeric ranges from ml_training_research
+          (hyperparameter_ranges) as the search space; prefix params with 'model__'
+          inside a Pipeline.
+        - Report best_params_ and refit on the full training set (RandomizedSearchCV
+          does this automatically with refit=True).
+
+        EVALUATION & ARTIFACTS:
+        - Compute metrics on BOTH the training set and the held-out test set, and
+          include both in the metrics JSON: {{'train': {{...}}, 'test': {{...}},
+          'cv_mean': ..., 'cv_std': ..., 'best_params': {{...}}}}.
+          The train/test gap is how the validator detects overfitting — never omit it.
+        - 5-fold cross-validation scores printed in full.
         - For classification: confusion matrix PNG, ROC curve PNG (binary only)
         - For regression: actual-vs-predicted PNG, residual plot PNG
         - Feature importance PNG if model supports it (tree-based models)
-        - Save model:
+        - Save the FULL PIPELINE (not the bare model), so scaling/encoding travel
+          with it and it can score raw preprocessed rows directly:
             # joblib is safe here — models are saved by this pipeline and loaded
             # only within the same run from our own ml_outputs/ directory.
             # Never load joblib files from untrusted / external sources.
-            joblib.dump(model, os.path.join(ML_OUTPUTS_DIR, 'ModelName.joblib'))
+            joblib.dump(pipeline, os.path.join(ML_OUTPUTS_DIR, 'ModelName.joblib'))
         - Save metrics: json.dump(metrics, open(os.path.join(ML_OUTPUTS_DIR, 'metrics_ModelName.json'),'w'))
         - Print a clear metrics summary at the end
 
@@ -868,12 +1138,25 @@ CODE REQUIREMENTS:
 - Wrap each model block in try/except so one failure does not stop others
 - In sandbox scripts always use sandbox_ml_outputs_dir ('/workspace/ml_outputs'), never the Windows ml_outputs_dir
 
+VALIDATOR RETRY HANDLING:
+If get_ml_plan_for_trainer() returns a non-empty ml_validation_feedback, you are in a
+RETRY after the ML validator failed your previous attempt:
+- Do NOT retrain models that already passed. Fix ONLY the specific issues listed.
+- Typical fixes: a suspicious feature the validator flagged (drop it and retrain that
+  model), a missing artifact (regenerate it), an overfit model (constrain depth /
+  add regularization and retune), a wrong split strategy (rebuild with the right one).
+- After the targeted fixes, call save_training_results() for each retrained model and
+  mark_training_complete() again with the updated winner.
+
 COLAB LIFECYCLE (GPU sessions cost free quota — manage carefully):
 - For standard ML (scikit-learn, XGBoost, LightGBM): use local Docker sandbox only. Do NOT start Colab.
 - For GPU-needed models (neural networks, large deep learning): follow this exact sequence:
     1. Call start_colab_runtime() — starts the bridge. First run opens a browser for Google login.
     2. Wait for "started" status, then proceed with colab_mcp execute_code tools for training.
-    3. When ALL GPU training is done, call stop_colab_runtime() IMMEDIATELY to free GPU hours.
+    3. When ALL GPU training is done: FIRST execute
+       'from google.colab import runtime; runtime.unassign()' as a Colab cell via the
+       colab_mcp execute_code tool (this releases the GPU), THEN call
+       stop_colab_runtime() to kill the local bridge.
        This is critical — idle Colab GPU sessions still drain the free quota.
     4. Then call mark_training_complete() to finish the phase.
 - If start_colab_runtime() returns "skipped" (COLAB_MCP_DIR not configured), fall back to sandbox.
@@ -882,9 +1165,110 @@ COLAB LIFECYCLE (GPU sessions cost free quota — manage carefully):
 )
 
 
+# ---- ML Validation Agent (audits training results; mirrors preprocessing Agent 4) ----
+ml_validation_agent = Agent(
+    model=REASONING_MODEL,
+    name="ml_validation_agent",
+    description="Audits training artifacts for leakage, overfitting, and plan compliance; passes or fails the training run.",
+    output_key="ml_validation_result",
+    instruction="""You are the ML Training Validator — a skeptical senior reviewer.
+Your job is to decide whether the training results are TRUSTWORTHY, not just present.
+
+WORKFLOW:
+1. Call get_ml_plan_for_trainer() — load the plan and any previous validation iterations.
+   - If ml_validation_iterations already contains a PASS for this run, respond
+     "Training already validated (PASS)" and STOP — do not re-audit.
+2. Call validate_ml_results() — this audits the metrics/artifacts on disk directly.
+3. Cross-check against the plan:
+   - Was every planned model actually trained (a metrics file + joblib per model)?
+   - Was the planned evaluation metric used?
+   - Were advanced models tuned (best_params present and not 'defaults')?
+   - Does model_comparison.csv exist?
+4. Call save_ml_validation_result() with your verdict.
+
+FAIL CONDITIONS (any one is enough):
+- Any model shows a leakage signature (near-perfect test metrics >= 0.995 on
+  accuracy/F1/AUC/R2) — this is a FAIL even though the numbers look "good".
+  Perfect scores on real-world data are almost always a leaked feature.
+- Any model shows a train-test gap > 0.15 on a higher-better metric (overfitting).
+- A planned model was never trained, or its .joblib/metrics file is missing.
+- Advanced models were not hyperparameter-tuned.
+- model_comparison.csv is missing.
+
+PASS CONDITIONS:
+- All planned models trained, tuned, and persisted with plots.
+- Metrics are plausible (no leakage/overfit signatures) and include train+test blocks.
+- Quality score >= 7/10.
+
+FEEDBACK RULES (when you FAIL):
+- Be surgical: name the exact model, the exact issue, and the exact fix.
+  GOOD: "XGBoost test accuracy is 1.0 — inspect feature importances; if one feature
+  dominates (>90%), drop it and retrain ONLY XGBoost."
+  BAD: "results look wrong, retrain everything."
+- Never tell the trainer to redo work that passed.
+- If this is iteration 3, be pragmatic: PASS with documented warnings unless a
+  leakage signature remains (leakage is never acceptable).
+""",
+    tools=[
+        get_ml_plan_for_trainer,
+        validate_ml_results,
+        save_ml_validation_result,
+    ],
+)
+
+
+# ---- Loop escalation checker (stop on PASS or max retries) ----
+class MLLoopEscalationChecker(BaseAgent):
+    """Stops the train↔validate loop when validation passes or retries are exhausted."""
+
+    async def _run_async_impl(
+        self,
+        ctx: InvocationContext,
+    ) -> AsyncGenerator[Event, None]:
+        try:
+            state = load_state()
+            iterations = state.get("ml_validation_iterations", [])
+            verdict = iterations[-1].get("verdict", "") if iterations else ""
+            iteration = state.get("ml_loop_iteration", 0)
+        except Exception as e:
+            print(f"[ML LOOP] Could not read pipeline state: {e} — stopping loop.", flush=True)
+            save_state({"status": "ml_complete_with_warnings", "ml_loop_error": str(e)})
+            yield Event(author=self.name, actions=EventActions(escalate=True))
+            return
+
+        status = state.get("status", "")
+        # Trainer finished but validator never saved a verdict → escalate rather than spin.
+        trainer_done_no_validation = status == "ml_complete" and not iterations
+
+        should_stop = (verdict == "PASS") or (iteration >= 3) or trainer_done_no_validation
+
+        if should_stop and verdict != "PASS":
+            final_status = "ml_complete" if trainer_done_no_validation else "ml_complete_with_warnings"
+            save_state({"status": final_status})
+            print(
+                f"[ML LOOP] Escalating — verdict={verdict!r}, iteration={iteration}, "
+                f"trainer_done_no_validation={trainer_done_no_validation}",
+                flush=True,
+            )
+
+        yield Event(author=self.name, actions=EventActions(escalate=should_stop))
+
+
+ml_training_validation_loop = LoopAgent(
+    name="ml_training_validation_loop",
+    description="Trains models then audits them for leakage/overfitting; retries with feedback until PASS or max retries.",
+    max_iterations=3,
+    sub_agents=[
+        ml_model_trainer,
+        ml_validation_agent,
+        MLLoopEscalationChecker(name="ml_loop_escalation_checker"),
+    ],
+)
+
+
 # ---- Agent 3: ML Report Writer ----
 ml_report_writer = Agent(
-    model=MODEL,
+    model=LIGHT_MODEL,
     name="ml_report_writer",
     description="Reads all pipeline outputs and writes the comprehensive final project report.",
     output_key="final_report",
@@ -956,7 +1340,8 @@ import joblib, pandas as pd
 # Safe to load: this file was saved by this pipeline from our own training code.
 # Do NOT load joblib files from untrusted/external sources (equivalent to pickle).
 model = joblib.load('outputs/ml_outputs/<BestModelName>.joblib')
-# new_data must have the same columns as the training data, preprocessed the same way
+# The saved artifact is a full sklearn Pipeline — scaling/encoding are applied
+# automatically. new_data just needs the same columns as the preprocessed dataset.
 predictions = model.predict(new_data)
 ```
 
@@ -1019,6 +1404,50 @@ def _ml_search(query: str, domain_filter: str = "all") -> str:
         return json.dumps({"error": str(e)})
 
 
+def _ml_fetch_page(url: str) -> str:
+    """
+    Fetch the FULL text of a page found via _ml_search (search snippets are only
+    ~600 chars and almost never contain real hyperparameter tables or API
+    signatures). Use this to read the actual docs/paper/leaderboard page.
+
+    Args:
+        url: The URL of the page to read.
+    Returns:
+        JSON with the page's extracted text (truncated to 12000 chars) or an error.
+    """
+    try:
+        resp = _tavily_ml.extract(urls=[url])
+        results = resp.get("results", [])
+        if not results:
+            return json.dumps({
+                "error": "No content could be extracted from this URL.",
+                "failed": resp.get("failed_results", []),
+            })
+        content = (results[0].get("raw_content") or "")[:12000]
+        return json.dumps({"url": url, "content": content}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def get_sandbox_library_versions() -> str:
+    """
+    Return the exact Python library versions installed in the execution sandbox
+    (from docker/requirements.txt). Training code must target these versions.
+    """
+    req_file = PROJECT_ROOT / "docker" / "requirements.txt"
+    if not req_file.exists():
+        return json.dumps({"error": f"requirements file not found: {req_file}"})
+    lines = [
+        ln.strip() for ln in req_file.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    return json.dumps({
+        "sandbox_python": "3.12 (python:3.12-slim base image)",
+        "installed_packages": lines,
+        "note": "Verify API and hyperparameter recommendations against these versions.",
+    }, indent=2)
+
+
 def _ml_save_research(
     problem_type: str,
     ranked_models: str,
@@ -1059,7 +1488,13 @@ def _ml_save_research(
     return json.dumps({"status": "saved"}, indent=2)
 
 
-_ml_research_tools = [get_full_pipeline_context, _ml_search, _ml_save_research]
+_ml_research_tools = [
+    get_full_pipeline_context,
+    get_sandbox_library_versions,
+    _ml_search,
+    _ml_fetch_page,
+    _ml_save_research,
+]
 try:
     from mcp_servers.mcp_servers import tavily_mcp as _ml_tavily_mcp
     _ml_research_tools.append(_ml_tavily_mcp)
@@ -1067,15 +1502,16 @@ except Exception:
     pass
 
 _ml_research_agent = Agent(
-    model="gemini-3.1-flash-lite",
+    model=LIGHT_MODEL,
     name="ml_research_agent",
     description="Researches SOTA models, hyperparameters, and evaluation strategies before the strategy planner runs.",
     output_key="ml_research_output",
-    instruction="""You are the ML Research Agent — the FIRST agent in the ML training pipeline.
+    instruction=f"""You are the ML Research Agent — the FIRST agent in the ML training pipeline.
+The current year is {datetime.date.today().year}.
 
 PIPELINE CONTEXT
 You live inside a SequentialAgent:
-  [You] → ML Strategy Planner → ML Model Trainer → ML Report Writer
+  [You] → ML Strategy Planner → ML Model Trainer (with validator loop) → ML Report Writer
 
 The ML Strategy Planner reads your findings from pipeline_state.json immediately after you.
 Give it SPECIFIC numbers and ranked recommendations — it will build the training plan from them.
@@ -1085,38 +1521,45 @@ YOUR TASK
 1. Call get_full_pipeline_context() to load the full project state, preprocessed data profile,
    and user constraints (compute, timeline, skill level from qa_pairs).
 
-2. Confirm the exact problem type from the preprocessed dataset:
+2. Call get_sandbox_library_versions() — training code runs against these EXACT
+   library versions. Your API and hyperparameter advice must match them.
+
+3. Confirm the exact problem type from the preprocessed dataset:
    • Binary / multi-class classification vs regression vs clustering vs time-series
    • Dataset size and dimensionality (affects model capacity)
    • Class balance ratio (critical for metric and strategy choice)
 
-3. Research SOTA for this exact task — use ALL available search tools:
-   _ml_search('state of the art <problem_type> <domain> 2025 benchmark', domain_filter='paperswithcode.com,arxiv.org')
-   _ml_search('best model tabular <task> kaggle winning solution 2024 2025')
-   Google Search: 'site:paperswithcode.com <task> <domain> leaderboard'
+4. Research SOTA for this exact task — use ALL available search tools:
+   _ml_search('state of the art <problem_type> <domain> {datetime.date.today().year} benchmark', domain_filter='paperswithcode.com,arxiv.org')
+   _ml_search('best model tabular <task> kaggle winning solution {datetime.date.today().year - 1} {datetime.date.today().year}')
 
-4. Research hyperparameters for the top 3-5 candidate models:
-   _ml_search('XGBoostClassifier best hyperparameters <task> 2025 optuna')
-   _ml_search('LightGBM num_leaves learning_rate tuning tabular 2025')
-   _ml_search('sklearn RandomForestClassifier hyperparameter grid 2025')
+5. Research hyperparameters for the top 3-5 candidate models:
+   _ml_search('XGBoostClassifier best hyperparameters <task> {datetime.date.today().year} optuna')
+   _ml_search('LightGBM num_leaves learning_rate tuning tabular {datetime.date.today().year}')
+   _ml_search('sklearn RandomForestClassifier hyperparameter grid {datetime.date.today().year}')
    Find ACTUAL NUMERIC RANGES — not vague guidance.
+   For any range or API you are not 100% sure about, call _ml_fetch_page(url) on the
+   most authoritative result (official docs, paper, Kaggle solution write-up) and
+   verify against the full page text — snippets are too short to trust.
 
-5. Research evaluation best practices:
-   _ml_search('evaluation metrics <problem_type> sklearn pitfalls 2025')
+6. Research evaluation best practices:
+   _ml_search('evaluation metrics <problem_type> sklearn pitfalls {datetime.date.today().year}')
    • Which metric is correct for this task and class distribution?
    • StratifiedKFold vs KFold vs TimeSeriesSplit?
    • Common mistakes (e.g. accuracy on imbalanced data, AUC vs F1 trade-off)
 
-6. Call _ml_save_research() with ALL fields:
+7. Call _ml_save_research() with ALL fields:
    • ranked_models: ordered list with one-line evidence per model
-   • hyperparameter_ranges: NUMBERS (e.g. 'max_depth: 3-10, lr: 0.01-0.3')
+   • hyperparameter_ranges: NUMBERS (e.g. 'max_depth: 3-10, lr: 0.01-0.3') — the
+     trainer plugs these directly into RandomizedSearchCV/Optuna
    • evaluation_strategy: exact metric name, CV method, n_splits
-   • training_tips: code-level instructions the trainer agent can use directly
+   • training_tips: code-level instructions the trainer agent can use directly,
+     including the library versions you verified against
 
 RULES
 - Hyperparameter ranges must be numeric — never 'tune appropriately'
 - Every model ranking must cite a reason tied to THIS dataset's characteristics
-- Use search to get 2024/2025 info — your training data may be outdated
+- Use search + _ml_fetch_page for current info — your training data may be outdated
 - sota_benchmarks must be real numbers from actual papers or Kaggle leaderboards
 """,
     tools=_ml_research_tools,
@@ -1128,12 +1571,12 @@ root_agent = SequentialAgent(
     name="ml_pipeline_agent",
     description=(
         "End-to-end ML pipeline: "
-        "research → strategy planning → model training → final report generation."
+        "research → strategy planning → train+validate loop → final report generation."
     ),
     sub_agents=[
         _ml_research_agent,
         ml_strategy_planner,
-        ml_model_trainer,
+        ml_training_validation_loop,
         ml_report_writer,
     ],
 )

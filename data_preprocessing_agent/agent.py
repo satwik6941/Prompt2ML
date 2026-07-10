@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import asyncio
+import datetime
 from pathlib import Path
 from typing import AsyncGenerator
 from dotenv import load_dotenv
@@ -33,8 +34,9 @@ load_dotenv()
 # CONSTANTS
 # ============================================================
 
-MODEL = "gemini-3.1-flash-lite"
 PROJECT_ROOT = Path(__file__).parent.parent
+
+from model_config import CODING_MODEL, REASONING_MODEL, LIGHT_MODEL
 DATASETS_DIR = PROJECT_ROOT / "datasets"
 MODIFIED_DATASETS_DIR = PROJECT_ROOT / "modified_datasets"   # base root — never written to directly
 # All step files are written to modified_datasets/<problem-slug>/ via get_run_dir()
@@ -382,6 +384,11 @@ def save_preprocessing_plan(
     Save the complete preprocessing plan to pipeline_state.json.
     Agent 3 will read this plan and execute each step.
 
+    FORMAT NOTE: for every per-column field below, PREFER a JSON object string
+    (e.g. '{"age": "fill_median", "city": "fill_mode"}') over the legacy
+    'col:method,col:method' format — commas or colons inside reasons/values
+    silently corrupt the legacy format. Both are accepted.
+
     Args:
         plan_summary: A 2-3 sentence summary of the overall preprocessing approach.
         target_column: The target/label column name for ML (or 'none' if unsupervised).
@@ -389,9 +396,14 @@ def save_preprocessing_plan(
         missing_value_strategy: Detailed strategy per column (format: 'col:strategy,col:strategy').
             Strategies: drop_rows, fill_mean, fill_median, fill_mode, fill_zero, fill_ffill, fill_custom.
         encoding_strategy: How to encode categorical columns (format: 'col:method,col:method').
-            Methods: label_encode, onehot_encode, ordinal_encode, target_encode, frequency_encode, drop.
-        scaling_strategy: How to scale numeric columns (format: 'col:method,col:method' or 'all:method').
+            Methods: label_encode, onehot_encode, ordinal_encode, frequency_encode, drop,
+            target_encode_deferred (recorded here but applied ONLY inside the ML training
+            pipeline, fit on training folds — never at preprocessing time, to avoid leakage).
+        scaling_strategy: Which scaler each numeric column needs (format: 'col:method,col:method' or 'all:method').
             Methods: standard, minmax, robust, log_transform, none.
+            NOTE: scaling is NOT executed during preprocessing. It is recorded in the plan
+            and applied by the ML trainer inside a sklearn Pipeline (fit on train data only)
+            to prevent train/test leakage. Do not include scale_numerics in step_by_step_order.
         outlier_strategy: How to handle outliers (format: 'col:method,col:method').
             Methods: clip_iqr, remove_iqr, clip_zscore, remove_zscore, log_transform, keep.
         feature_engineering: New features to create (format: 'new_col:formula_or_description,...').
@@ -488,14 +500,16 @@ def _resolve_local_path(p: str) -> str:
 def _next_step_path(tool_name: str) -> str:
     """
     Generate the next auto-named step output path and increment the step counter.
-    Files are written to modified_datasets/<problem-slug>/step_N_<tool_name>.csv
-    so each pipeline run is isolated in its own subfolder.
+    Files are written to modified_datasets/<problem-slug>/step_N_<tool_name>.parquet
+    so each pipeline run is isolated in its own subfolder. Parquet preserves
+    dtypes (categories, datetimes, nullable ints) that CSV round-trips destroy;
+    the FINAL output is still exported as CSV by save_preprocessed_output.
     """
     state = load_state()
     step_num = state.get("current_step", 0) + 1
     save_state({"current_step": step_num})
     run_dir = get_run_dir()
-    return str(run_dir / f"step_{step_num}_{tool_name}.csv")
+    return str(run_dir / f"step_{step_num}_{tool_name}.parquet")
 
 
 def _latest(value) -> dict:
@@ -509,6 +523,43 @@ def _latest(value) -> dict:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _parse_col_map(value) -> dict:
+    """
+    Parse a plan field mapping columns to methods. Accepts, in order of preference:
+      - a JSON object string: '{"age": "fill_median", "city": "onehot"}'
+      - an already-parsed dict
+      - the legacy delimited format: 'age:fill_median,city:onehot' (fragile —
+        breaks when values contain commas, kept for old pipeline_state files)
+      - a bare comma list 'col1,col2' (columns map to empty string)
+    Returns {} for empty/'none' values.
+    """
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    if not isinstance(value, str) or not value.strip() or value.strip().lower() == "none":
+        return {}
+    s = value.strip()
+    if s.startswith("{"):
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return {str(k): str(v) for k, v in parsed.items()}
+        except json.JSONDecodeError:
+            pass  # fall through to legacy parsing
+    result: dict = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            col, method = part.split(":", 1)
+        else:
+            col, method = part, ""
+        col = col.strip()
+        if col and col.lower() != "none":
+            result[col] = method.strip()
+    return result
 
 
 def _parse_json_param(param: str, param_name: str) -> tuple:
@@ -530,10 +581,24 @@ def _parse_json_param(param: str, param_name: str) -> tuple:
 
 def _safe_read_csv(path: str):
     """
-    Read a CSV file with graceful error handling for encoding issues and corruption.
+    Read a tabular data file (CSV or Parquet, by extension) with graceful error
+    handling for encoding issues and corruption.
+    Parquet is used for intermediate step files because CSV round-trips destroy
+    dtype information (categories, parsed dates, nullable ints).
     Returns (dataframe, None) on success, or (None, error_json_string) on failure.
     """
     import pandas as pd
+
+    if str(path).lower().endswith(".parquet"):
+        try:
+            return pd.read_parquet(path), None
+        except Exception as e:
+            return None, json.dumps({
+                "error": f"Could not read Parquet: {e}",
+                "path": path,
+                "fix": "Ensure the file exists and is a valid Parquet file.",
+            }, indent=2)
+
     encodings = ["utf-8", "latin-1", "cp1252"]
     last_err = None
     for enc in encodings:
@@ -554,12 +619,16 @@ def _safe_read_csv(path: str):
 
 def _safe_write_csv(df, output_path: str) -> str | None:
     """
-    Write a DataFrame to CSV with error handling.
+    Write a DataFrame to CSV or Parquet (chosen by the output_path extension)
+    with error handling.
     Returns None on success, or an error JSON string on failure.
     Saves last_step_output_path to state on every successful write for crash recovery.
     """
     try:
-        df.to_csv(output_path, index=False)
+        if str(output_path).lower().endswith(".parquet"):
+            df.to_parquet(output_path, index=False)
+        else:
+            df.to_csv(output_path, index=False)
         save_state({"last_step_output_path": output_path})
         return None
     except OSError as e:
@@ -872,13 +941,19 @@ def encode_categorical_columns(
                 details[col] = {"status": "skipped", "reason": f"not binary — has {len(unique_vals)} unique values"}
 
         elif method.startswith("target:"):
-            target_col = method.split(":", 1)[1]
-            if target_col in df.columns:
-                means = df.groupby(col)[target_col].mean()
-                df[col] = df[col].map(means)
-                details[col] = {"method": "target_encoding", "target": target_col}
-            else:
-                details[col] = {"status": "skipped", "reason": f"target column '{target_col}' not found"}
+            # Target encoding fit on the FULL dataset leaks label information into
+            # features and inflates every downstream metric. It must be fit on
+            # training folds only, which happens inside the ML training pipeline.
+            details[col] = {
+                "status": "refused",
+                "reason": (
+                    "Target encoding at preprocessing time causes data leakage (it uses the "
+                    "label before the train/test split exists). This column is left as-is; "
+                    "the ML trainer will target-encode it inside a sklearn Pipeline fit on "
+                    "training data only. Use 'frequency' or 'ordinal:...' here if you need a "
+                    "leakage-free encoding at this stage."
+                ),
+            }
 
     write_err = _safe_write_csv(df, output_path)
     if write_err:
@@ -1147,7 +1222,9 @@ def parse_datetime_columns(
             continue
 
         try:
-            dt = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
+            # infer_datetime_format was deprecated in pandas 2.0 and removed in 3.x;
+            # format inference is the default behavior now.
+            dt = pd.to_datetime(df[col], errors="coerce")
         except Exception as e:
             details[col] = {"status": "error", "reason": str(e)}
             continue
@@ -1264,6 +1341,16 @@ def engineer_features(
         try:
             if definition.startswith("formula:"):
                 expr = definition.split(":", 1)[1]
+                # Guard: pd.eval expressions must be pure column arithmetic.
+                # '@' (local variable access), '.' attribute chains and dunder
+                # names open escape hatches; complex logic belongs in the sandbox.
+                if "@" in expr or "__" in expr:
+                    details[new_col] = {
+                        "status": "rejected",
+                        "reason": "formula may only reference columns and arithmetic operators "
+                                  "(no '@' or '__'). Use run_in_sandbox for complex transforms.",
+                    }
+                    continue
                 df[new_col] = df.eval(expr)
 
             elif definition.startswith("str_len:"):
@@ -1723,6 +1810,10 @@ def save_preprocessed_output(
     import shutil
 
     run_dir = get_run_dir()
+    # The final artifact is always CSV — downstream ML tools and sandbox scripts
+    # expect it. Intermediate steps are Parquet, so convert when needed.
+    if not output_filename.lower().endswith(".csv"):
+        output_filename = str(Path(output_filename).with_suffix(".csv"))
     dest = run_dir / output_filename
 
     try:
@@ -1731,7 +1822,13 @@ def save_preprocessed_output(
         return json.dumps({"error": str(e)}, indent=2)
 
     try:
-        shutil.copy2(dataset_path, dest)
+        if dataset_path.lower().endswith(".parquet"):
+            df, err = _safe_read_csv(dataset_path)  # handles parquet by extension
+            if err:
+                return err
+            df.to_csv(dest, index=False)
+        else:
+            shutil.copy2(dataset_path, dest)
     except OSError as e:
         return json.dumps({
             "error": f"Could not copy preprocessed file to output: {e}",
@@ -1811,10 +1908,14 @@ def compare_before_after(
     try:
         original_path = _resolve_local_path(original_path)
         preprocessed_path = _resolve_local_path(preprocessed_path)
-        orig = pd.read_csv(original_path)
-        proc = pd.read_csv(preprocessed_path)
-    except Exception as e:
+    except FileNotFoundError as e:
         return json.dumps({"error": str(e)})
+    orig, err = _safe_read_csv(original_path)
+    if err:
+        return err
+    proc, err = _safe_read_csv(preprocessed_path)
+    if err:
+        return err
 
     comparison = {
         "shape": {"original": list(orig.shape), "preprocessed": list(proc.shape)},
@@ -1926,10 +2027,10 @@ missing_check['passed'] = pre.isnull().sum().sum() <= orig.isnull().sum().sum()
 results['check_handle_missing'] = missing_check
 """)
 
-    # columns_to_drop
+    # columns_to_drop — accepts JSON dict, 'col:reason,...' or bare 'col1,col2'
     cols_to_drop = plan.get("columns_to_drop", "none")
-    if cols_to_drop and cols_to_drop.lower() not in ("none", ""):
-        drop_cols = [c.strip().split(":")[0] for c in cols_to_drop.split(",") if c.strip() and c.strip().lower() != "none"]
+    if cols_to_drop and str(cols_to_drop).lower() not in ("none", ""):
+        drop_cols = list(_parse_col_map(cols_to_drop).keys())
         if drop_cols:
             checks.append(f"""
 # Check: specified columns were dropped
@@ -1940,72 +2041,25 @@ drop_check['passed'] = len(drop_check['still_present']) == 0
 results['check_drop_columns'] = drop_check
 """)
 
-    # scaling_strategy — parse "col:method,col:method" or "col:method"
+    # scaling_strategy — scaling is DEFERRED to the ML training pipeline
+    # (fit on train folds only) to prevent leakage, so the preprocessed file
+    # is intentionally UNSCALED. No scaling checks are generated; instead we
+    # record the deferred plan so the validator can see it was intentional.
     scaling_strategy = plan.get("scaling_strategy", "none")
     if scaling_strategy and scaling_strategy.lower() not in ("none", ""):
-        # Build per-column scaling checks
-        scale_checks_code = []
-        parts = [p.strip() for p in scaling_strategy.split(",") if p.strip()]
-        for part in parts:
-            tokens = part.split(":")
-            if len(tokens) < 2:
-                continue
-            col = tokens[0].strip()
-            method = tokens[1].strip().lower()
-            if col.lower() == "none" or method.lower() == "none":
-                continue
-            if method == "robust":
-                scale_checks_code.append(f"""
-if '{col}' in pre.columns:
-    median_val = float(pre['{col}'].median())
-    q75 = float(pre['{col}'].quantile(0.75))
-    q25 = float(pre['{col}'].quantile(0.25))
-    iqr_val = q75 - q25
-    results['check_scale_{col}_robust'] = {{
-        'planned': 'robust',
-        'median': round(median_val, 4),
-        'iqr': round(iqr_val, 4),
-        'passed': abs(median_val) < 0.5 and 0.5 < iqr_val < 2.0
-    }}
+        checks.append(f"""
+results['scaling_deferred_to_training'] = {{
+    'planned_for_training_pipeline': '''{str(scaling_strategy)[:200]}''',
+    'note': 'Data is intentionally unscaled here; the ML trainer scales inside a Pipeline fit on train data only.'
+}}
 """)
-            elif method == "standard":
-                scale_checks_code.append(f"""
-if '{col}' in pre.columns:
-    mean_val = float(pre['{col}'].mean())
-    std_val = float(pre['{col}'].std())
-    results['check_scale_{col}_standard'] = {{
-        'planned': 'standard',
-        'mean': round(mean_val, 4),
-        'std': round(std_val, 4),
-        'passed': abs(mean_val) < 0.1 and abs(std_val - 1.0) < 0.2
-    }}
-""")
-            elif method == "minmax":
-                scale_checks_code.append(f"""
-if '{col}' in pre.columns:
-    min_val = float(pre['{col}'].min())
-    max_val = float(pre['{col}'].max())
-    results['check_scale_{col}_minmax'] = {{
-        'planned': 'minmax',
-        'min': round(min_val, 4),
-        'max': round(max_val, 4),
-        'passed': min_val >= -0.01 and max_val <= 1.01
-    }}
-""")
-        if scale_checks_code:
-            checks.extend(scale_checks_code)
 
-    # encoding_strategy — parse "col:method,col:method"
+    # encoding_strategy — accepts JSON dict or legacy "col:method,col:method"
     encoding_strategy = plan.get("encoding_strategy", "none")
-    if encoding_strategy and encoding_strategy.lower() not in ("none", ""):
-        parts = [p.strip() for p in encoding_strategy.split(",") if p.strip()]
-        for part in parts:
-            tokens = part.split(":")
-            if len(tokens) < 2:
-                continue
-            col = tokens[0].strip()
-            method = tokens[1].strip().lower()
-            if col.lower() == "none" or method.lower() == "none":
+    if encoding_strategy and str(encoding_strategy).lower() not in ("none", ""):
+        for col, raw_method in _parse_col_map(encoding_strategy).items():
+            method = raw_method.split(":")[0].strip().lower()
+            if not method or method == "none" or "deferred" in method:
                 continue
             if method == "onehot":
                 checks.append(f"""
@@ -2031,17 +2085,12 @@ else:
 results['check_encode_{col}_{method}'] = enc_check
 """)
 
-    # outlier_strategy — parse "col:method,col:method"
+    # outlier_strategy — accepts JSON dict or legacy "col:method,col:method"
     outlier_strategy = plan.get("outlier_strategy", "none")
-    if outlier_strategy and outlier_strategy.lower() not in ("none", ""):
-        parts = [p.strip() for p in outlier_strategy.split(",") if p.strip()]
-        for part in parts:
-            tokens = part.split(":")
-            if len(tokens) < 2:
-                continue
-            col = tokens[0].strip()
-            method = tokens[1].strip().lower()
-            if col.lower() == "none" or method.lower() in ("none", "keep"):
+    if outlier_strategy and str(outlier_strategy).lower() not in ("none", ""):
+        for col, raw_method in _parse_col_map(outlier_strategy).items():
+            method = raw_method.split(":")[0].strip().lower()
+            if not method or method in ("none", "keep"):
                 continue
             checks.append(f"""
 if '{col}' in orig.columns and '{col}' in pre.columns:
@@ -2116,8 +2165,11 @@ import pandas as pd
 import numpy as np
 import json
 
-orig = pd.read_csv('{orig_sandbox}')
-pre = pd.read_csv('{pre_sandbox}')
+def read_any(p):
+    return pd.read_parquet(p) if p.endswith('.parquet') else pd.read_csv(p)
+
+orig = read_any('{orig_sandbox}')
+pre = read_any('{pre_sandbox}')
 
 results = {{}}
 
@@ -2286,6 +2338,7 @@ def load_full_pipeline_context() -> str:
             proc_stats = {"error": "could not read preprocessed dataset"}
 
     context = {
+        "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
         "user_goal": state.get("user_goal", ""),
         "qa_pairs": state.get("qa_pairs", []),
         "agent1_output": _latest(state.get("agent1_output")),
@@ -2407,7 +2460,7 @@ def get_preprocessing_resume_state() -> str:
 
 # --- Agent 1: Dataset Analyzer ---
 dataset_analyzer_agent = Agent(
-    model=MODEL,
+    model=LIGHT_MODEL,
     name="dataset_analyzer_agent",
     description="Analyzes all available datasets and selects the best one for the user's ML project.",
     output_key="agent1_result",
@@ -2449,7 +2502,7 @@ After saving, respond with a brief summary of which dataset you selected and why
 
 # --- Agent 2: Preprocessing Strategist ---
 preprocessing_strategist_agent = Agent(
-    model=MODEL,
+    model=REASONING_MODEL,
     name="preprocessing_strategist_agent",
     description="Analyzes the selected dataset deeply and creates a detailed preprocessing plan.",
     output_key="agent2_result",
@@ -2477,13 +2530,25 @@ PLANNING PRINCIPLES:
 - Be careful with target leakage — don't use the target column in feature engineering
 - Consider column relationships — if two columns are 95%+ correlated, suggest dropping one
 - For text columns, choose methods based on cardinality and relevance
-- Order matters: always handle missing values BEFORE encoding, and encoding BEFORE scaling
+- Order matters: always handle missing values BEFORE encoding
 - Include validation checks that verify the preprocessing didn't corrupt the data
+
+LEAKAGE RULES (critical — these decide whether the final metrics are trustworthy):
+- SCALING IS DEFERRED: plan the scaler per column in scaling_strategy, but do NOT put
+  scale_numerics in step_by_step_order. The ML trainer applies the scaler inside a
+  sklearn Pipeline fit on training data only.
+- TARGET ENCODING IS DEFERRED: never plan target/mean encoding at preprocessing time.
+  If a high-cardinality column needs it, record 'col:target_encode_deferred' in
+  encoding_strategy — the ML trainer will use sklearn's TargetEncoder inside its Pipeline.
+- TF-IDF: only plan 'tfidf' at preprocessing for exploratory/clustering goals. For
+  supervised tasks with important text, plan 'clean_and_keep' so the raw text survives
+  and the ML trainer can fit TfidfVectorizer on training folds only.
 
 STEP ORDER (follow this standard order, skip steps that don't apply):
 1. drop_columns → 2. handle_duplicates → 3. fix_data_types → 4. handle_missing →
 5. parse_dates → 6. process_text → 7. handle_outliers → 8. encode_categoricals →
-9. feature_engineering → 10. scale_numerics → 11. final_validation
+9. feature_engineering → 10. final_validation
+(scale_numerics is intentionally absent — scaling happens in the ML training pipeline)
 
 RULES:
 - You MUST call all tools in order
@@ -2499,7 +2564,7 @@ After saving, respond with a concise summary of your plan.
 
 # --- Agent 3: Preprocessing Executor ---
 preprocessing_executor_agent = Agent(
-    model=MODEL,
+    model=CODING_MODEL,
     name="preprocessing_executor_agent",
     description="Executes the preprocessing plan step by step using specialized tools and a SafeExecute sandbox environment.",
     output_key="agent3_result",
@@ -2552,7 +2617,9 @@ DEFAULT WORKFLOW (use built-in tools — no sandbox needed)
 3. For each step in step_by_step_order, call the matching built-in tool.
    - Each built-in tool returns the LOCAL path of its output file.
    - Use that returned path as the input to the next tool.
-   - Built-in tools automatically name their output files as step_N_<name>.csv — you do NOT specify output_path.
+   - Built-in tools automatically name their output files as step_N_<name>.parquet
+     (Parquet preserves dtypes between steps) — you do NOT specify output_path.
+   - The FINAL dataset is exported as CSV by save_preprocessed_output.
 4. After the last step, call save_preprocessed_output with the
    final LOCAL path. This finalizes Agent 3's work.
 
@@ -2597,7 +2664,10 @@ TOOL SELECTION GUIDE FOR PLAN STEPS
 - handle_outliers → handle_outliers tool
 - encode_categoricals → encode_categorical_columns tool
 - feature_engineering → engineer_features tool
-- scale_numerics → scale_numeric_columns tool
+- scale_numerics → DO NOT EXECUTE. Scaling is deferred to the ML training
+  pipeline (fit on train data only) to prevent leakage. If the plan still
+  contains a scale_numerics step, skip it and note "scaling deferred to
+  training" in save_preprocessed_output. Never call scale_numeric_columns.
 - final_validation → validate_dataset tool
 
 ================================================================
@@ -2625,7 +2695,7 @@ RULES:
 - Keep track of row counts — never lose more than 20% without good reason.
 - If you started the sandbox, you MUST stop it before finishing.
 - After EVERY run_in_sandbox call, immediately call log_sandbox_step with the script you wrote and the stdout returned. Agent 4 needs this to verify your sandbox work.
-- NEVER choose your own output filenames. Built-in tools generate step_N_<name>.csv automatically.
+- NEVER choose your own output filenames. Built-in tools generate step_N_<name>.parquet automatically.
 
 HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
 - Before executing any plan step, check if the referenced columns exist in the current dataset.
@@ -2646,7 +2716,8 @@ HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
         remove_duplicates,
         drop_columns,
         encode_categorical_columns,
-        scale_numeric_columns,
+        # scale_numeric_columns intentionally NOT exposed — scaling is deferred
+        # to the ML training pipeline (fit on train only) to prevent leakage.
         handle_outliers,
         parse_datetime_columns,
         engineer_features,
@@ -2669,7 +2740,7 @@ HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
 
 # --- Agent 4: Validation Agent ---
 validation_agent = Agent(
-    model=MODEL,
+    model=REASONING_MODEL,
     name="validation_agent",
     description="Validates preprocessing quality and provides feedback or approves the result.",
     output_key="agent4_validation",
@@ -2807,7 +2878,7 @@ code_gen_validation_loop = LoopAgent(
 
 # --- Agent 5: Report Generator ---
 report_generator_agent = Agent(
-    model=MODEL,
+    model=LIGHT_MODEL,
     name="report_generator_agent",
     description="Generates a comprehensive A-to-Z preprocessing report documenting every decision, transformation, and result.",
     output_key="final_report",
@@ -2998,6 +3069,51 @@ def _pp_search(query: str, domain_filter: str = "all") -> str:
         return json.dumps({"error": str(e)})
 
 
+def _pp_fetch_page(url: str) -> str:
+    """
+    Fetch the FULL text of a page found via _pp_search (search snippets are only
+    ~600 chars and almost never contain real API signatures). Use this to read
+    the actual documentation page before recommending an API.
+
+    Args:
+        url: The URL of the documentation/article page to read.
+    Returns:
+        JSON with the page's extracted text (truncated to 12000 chars) or an error.
+    """
+    try:
+        resp = _tavily_pp.extract(urls=[url])
+        results = resp.get("results", [])
+        if not results:
+            return json.dumps({
+                "error": "No content could be extracted from this URL.",
+                "failed": resp.get("failed_results", []),
+            })
+        content = (results[0].get("raw_content") or "")[:12000]
+        return json.dumps({"url": url, "content": content}, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def get_sandbox_library_versions() -> str:
+    """
+    Return the exact Python library versions installed in the execution sandbox
+    (from docker/requirements.txt). Recommendations and code MUST target these
+    versions — not whatever version the model remembers from training data.
+    """
+    req_file = PROJECT_ROOT / "docker" / "requirements.txt"
+    if not req_file.exists():
+        return json.dumps({"error": f"requirements file not found: {req_file}"})
+    lines = [
+        ln.strip() for ln in req_file.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    return json.dumps({
+        "sandbox_python": "3.12 (python:3.12-slim base image)",
+        "installed_packages": lines,
+        "note": "Verify API recommendations against these versions' documentation.",
+    }, indent=2)
+
+
 def _pp_save_research(
     recommended_techniques: str,
     library_api_notes: str,
@@ -3032,14 +3148,23 @@ def _pp_save_research(
     return json.dumps({"status": "saved"}, indent=2)
 
 
-_pp_research_tools = [get_project_context, _pp_search, _pp_save_research]
+_pp_research_tools = [
+    get_project_context,
+    get_sandbox_library_versions,
+    _pp_search,
+    _pp_fetch_page,
+    _pp_save_research,
+]
+
+_CURRENT_YEAR = datetime.date.today().year
 
 _preprocessing_research_agent = Agent(
-    model="gemini-3.1-flash-lite",
+    model=LIGHT_MODEL,
     name="preprocessing_research_agent",
     description="Researches optimal preprocessing techniques and library APIs before the strategist plans.",
     output_key="preprocessing_research_output",
-    instruction="""You are the Preprocessing Research Agent — the FIRST agent in the preprocessing pipeline.
+    instruction=f"""You are the Preprocessing Research Agent — the FIRST agent in the preprocessing pipeline.
+The current year is {_CURRENT_YEAR}.
 
 PIPELINE CONTEXT
 You live inside a SequentialAgent:
@@ -3052,39 +3177,48 @@ YOUR TASK
 
 1. Call get_project_context() to load the user goal, selected dataset, and data profile.
 
-2. Search for the RIGHT techniques for THIS specific dataset:
+2. Call get_sandbox_library_versions() — every API you recommend must exist in the
+   EXACT library versions installed in the execution sandbox. Record those versions.
 
-   MISSING VALUES — search: 'best imputation <data_type> sklearn 2025'
+3. Search for the RIGHT techniques for THIS specific dataset:
+
+   MISSING VALUES — search: 'best imputation <data_type> sklearn {_CURRENT_YEAR}'
    • Numeric: median (robust to outliers) or KNNImputer for correlated cols
    • Categorical: mode or add a 'Missing' category
    • >30% missing: consider dropping the column entirely
 
-   CATEGORICAL ENCODING — search: 'encoding high cardinality categorical sklearn 2025'
+   CATEGORICAL ENCODING — search: 'encoding high cardinality categorical sklearn {_CURRENT_YEAR}'
    • <15 unique values: OneHotEncoder (watch out for feature explosion)
-   • >50 unique values: OrdinalEncoder for tree models; TargetEncoder for linear models
+   • >50 unique values: OrdinalEncoder for tree models; target encoding for linear
+     models — but ONLY deferred into the training pipeline ('target_encode_deferred'),
+     never at preprocessing time (leakage)
    • NEVER use LabelEncoder on features for linear models
 
    SCALING — search: 'feature scaling sklearn StandardScaler RobustScaler when to use'
    • Tree models (RF, XGBoost, LightGBM): NO scaling needed
    • Linear / KNN / SVM / Neural: StandardScaler or RobustScaler (if outliers)
    • Skewed distributions: PowerTransformer(method='yeo-johnson')
+   • Scaling is applied INSIDE the ML training pipeline in this system, not at
+     preprocessing time — recommend WHICH scaler, the strategist records it as deferred.
 
-   TEXT COLUMNS — search: 'TfidfVectorizer sklearn parameters best practices 2025'
-   DATETIME — search: 'pandas datetime feature extraction ML 2025'
-   CLASS IMBALANCE — search: 'SMOTE imbalanced-learn sklearn 2025 pipeline'
+   TEXT COLUMNS — search: 'TfidfVectorizer sklearn parameters best practices {_CURRENT_YEAR}'
+   DATETIME — search: 'pandas datetime feature extraction ML {_CURRENT_YEAR}'
+   CLASS IMBALANCE — search: 'SMOTE imbalanced-learn sklearn {_CURRENT_YEAR} pipeline'
 
-3. Verify API correctness with search:
-   • 'pandas 2.0 breaking changes fillna inplace'
-   • 'sklearn 1.4 ColumnTransformer Pipeline correct usage'
-   Use Google Search or Tavily — do NOT rely on training data for API details.
+4. READ, don't skim: search snippets are ~600 chars and rarely contain real API
+   signatures. For any API you are not 100% sure about, call _pp_fetch_page(url)
+   on the most authoritative result (scikit-learn.org, pandas.pydata.org) and
+   verify the function name and parameters against the actual page text.
 
-4. Call _pp_save_research() with all fields filled with SPECIFIC recommendations.
+5. Call _pp_save_research() with all fields filled with SPECIFIC recommendations.
    step_order must list every step in sequence.
-   library_api_notes must include actual function names and parameters.
+   library_api_notes must include actual function names and parameters, PLUS the
+   library versions (from get_sandbox_library_versions) you verified them against.
 
 RULES
 - Every recommendation must match the actual data types found in the dataset
 - Cite the search source for any non-obvious technique choice
+- Do NOT rely on training data for API details — verify with _pp_fetch_page
 - The Strategist will follow your step_order directly — make it complete
 """,
     tools=_pp_research_tools,
