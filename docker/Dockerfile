@@ -1,4 +1,4 @@
-﻿FROM python:3.11-slim
+﻿FROM python:3.12-slim
 
 LABEL maintainer="Prompt2ML"
 LABEL description="Isolated ML execution sandbox for the Prompt2ML agent pipeline"
@@ -39,7 +39,7 @@ WORKDIR /workspace
 USER sandbox
 
 # Smoke-test: fail the build if any critical import is broken
-RUN python -c "import numpy, pandas, sklearn, scipy, matplotlib, seaborn, xgboost, lightgbm, catboost, statsmodels, imblearn, openpyxl, plotly, nltk, torch, joblib; print(chr(65)+chr(108)+chr(108)+chr(32)+chr(79)+chr(75))"
+RUN python -c "import numpy, pandas, sklearn, scipy, matplotlib, seaborn, xgboost, lightgbm, catboost, statsmodels, imblearn, openpyxl, plotly, nltk, torch, joblib, optuna, shap, category_encoders; print('All OK')"
 
 # Keep container alive when started detached by sandbox_executor.py
 CMD ["tail", "-f", "/dev/null"]
