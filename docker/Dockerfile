@@ -15,7 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         curl \
         ca-certificates \
+        procps \
     && apt-get clean && apt-get autoclean -y
+
+# procps supplies pkill, which sandbox_executor._exec_in_container needs to stop a
+# process that overran its timeout. python:3.12-slim omits it, and without it the
+# timeout abandons the worker thread while the runaway process keeps consuming the
+# container's CPU and memory budget.
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip --no-cache-dir && \

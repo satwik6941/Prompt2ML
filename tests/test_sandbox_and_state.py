@@ -138,6 +138,33 @@ def test_exec_timeout_is_configured():
     assert hasattr(sbx, "SandboxTimeout")
 
 
+def test_image_provides_pkill_for_timeout_kills():
+    """
+    The timeout path runs `pkill` inside the container to stop the overrun
+    process. pkill ships in procps, which python:3.12-slim omits — without it
+    the kill silently no-ops and a runaway job keeps burning the container's
+    CPU and memory after the timeout returns.
+    """
+    from pathlib import Path
+
+    dockerfile = Path(__file__).resolve().parents[1] / "docker" / "Dockerfile"
+    assert "procps" in dockerfile.read_text(encoding="utf-8"), (
+        "docker/Dockerfile must install procps so pkill exists in the sandbox image"
+    )
+
+
+def test_failed_timeout_kill_is_reported_not_swallowed():
+    """A silent `except: pass` here hides a surviving runaway process."""
+    import inspect
+
+    from data_preprocessing_agent import sandbox_executor as sbx
+
+    src = inspect.getsource(sbx._exec_in_container)
+    kill_block = src.split("if worker.is_alive():", 1)[1]
+    assert "exit_code" in kill_block, "pkill result must be checked"
+    assert "SANDBOX WARNING" in kill_block, "a failed kill must surface to the user"
+
+
 # --------------------------------------------------------------------------
 # State durability
 # --------------------------------------------------------------------------

@@ -299,11 +299,28 @@ def _exec_in_container(
     worker.join(timeout=budget if budget > 0 else None)
 
     if worker.is_alive():
-        # Best-effort kill so the abandoned process stops consuming the container.
+        # Kill the abandoned process so it stops consuming the container's budget.
+        # pkill comes from procps, installed by docker/Dockerfile — if that ever
+        # regresses the kill silently no-ops and a runaway job survives the
+        # timeout, so a failure here is reported rather than swallowed.
         try:
-            _container.exec_run(["pkill", "-9", "-f", cmd[-1]], stdout=False, stderr=False)
-        except Exception:
-            pass
+            kill = _container.exec_run(
+                ["pkill", "-9", "-f", cmd[-1]], stdout=True, stderr=True,
+            )
+            # pkill exits 1 when nothing matched (fine) and 127 when absent.
+            if kill.exit_code not in (0, 1):
+                print(
+                    f"[SANDBOX WARNING] Could not kill the timed-out process "
+                    f"(pkill exit {kill.exit_code}). It may still be running inside "
+                    f"'{_CONTAINER_NAME}'; call stop_sandbox() to reclaim resources.",
+                    flush=True,
+                )
+        except Exception as kill_exc:
+            print(
+                f"[SANDBOX WARNING] Kill after timeout failed ({kill_exc}). The "
+                f"process may still be running inside '{_CONTAINER_NAME}'.",
+                flush=True,
+            )
         raise SandboxTimeout(
             f"Execution exceeded {budget}s and was terminated. "
             "Reduce the work per step, sample the data, or raise "
