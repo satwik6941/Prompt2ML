@@ -1,10 +1,33 @@
+# --- Secrets ---
 .env
 .env.local
-.env.example
+# NOTE: .env.example is deliberately NOT ignored — it is the template users copy.
+
+# --- Editors / tooling ---
 .vscode/
 .idea/
 __pycache__/
+*.pyc
 .adk
-prompt2ml
+# Local virtualenv at the repo root. Anchored and trailing-slashed on purpose:
+# a bare `prompt2ml` pattern also matches src/prompt2ml/, silently excluding the
+# package itself from the repository.
+/prompt2ml/
 .ruff_cache/
+.pytest_cache/
 .remember
+
+# --- Run artifacts (regenerated on every run; never commit) ---
+pipeline_state.json
+pipeline_state.backup.json
+pipeline_state.corrupt.json
+pipeline_state.tmp
+datasets/
+modified_datasets/
+outputs/
+runs/
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/

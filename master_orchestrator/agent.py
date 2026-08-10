@@ -42,7 +42,6 @@ MODEL = REASONING_MODEL
 # Per-phase timeouts (seconds). Set to 0 to disable.
 PHASE2_TIMEOUT = 900   # 15 min — dataset search + download
 PHASE3_TIMEOUT = 1800  # 30 min — multi-agent preprocessing loop
-PHASE4_TIMEOUT = 600   # 10 min — report generation
 PHASE5_TIMEOUT = 3600  # 60 min — ML strategy planning, model training, and final report
 
 
@@ -180,7 +179,7 @@ from google.adk.agents import Agent
 
 # Import Phase 2 agent
 from data_extractor_agent.agent import dataset_extractor_agent
-from data_preprocessing_agent.agent import data_preprocessing_agent, report_generator_agent
+from data_preprocessing_agent.agent import data_preprocessing_agent
 # Import Phase 5 ML pipeline (SequentialAgent: planner → trainer → report writer)
 from machine_learning_agent.agent import root_agent as ml_pipeline_agent
 # --- Phase 1: Requirement Gatherer ---
@@ -446,6 +445,12 @@ async def run_pipeline():
         print(f"\n[PIPELINE] Report already exists for: {state['user_goal'][:80]}...")
         print("[PIPELINE] Skipping Phase 1, moving to Phase 2.\n")
     else:
+        # A brand-new project starts a brand-new run. Without this the run_id
+        # persisted from the previous run is reused, so modified_datasets/<run_id>/
+        # and outputs/<run_id>/ accumulate across unrelated projects and agents
+        # read the last project's reports as if they were this one's.
+        reset_run_id()
+
         # Get the user's project goal
         user_input = input("\nPlease tell me what you want to build: ")
 
@@ -624,76 +629,12 @@ async def run_pipeline():
         print("\n[PIPELINE] Phase 3 complete — datasets preprocessed!")
 
     # ==============================================================
-    # PHASE 4: Preprocessing Report Generation (autonomous)
+    # NOTE: preprocessing report generation is NOT a separate phase.
+    # report_generator_agent is the last sub-agent of the Phase 3
+    # SequentialAgent, so it has already run by this point. Driving the same
+    # agent instance from a second Runner also gave it two parents, which ADK
+    # does not support (sub_agents assignment sets parent_agent).
     # ==============================================================
-
-    print("\n" + "=" * 60)
-    print("  PROMPT2ML — Phase 4: Preprocessing Report")
-    print("=" * 60)
-
-    state = load_state()
-    report_path = state.get("report_path", "")
-    if state.get("status") == "pipeline_complete" and report_path and Path(report_path).exists():
-        print(f"\n[PIPELINE] Report already generated at: {report_path}. Skipping Phase 4.")
-    else:
-        SESSION_PHASE4 = "session_phase4"
-        await session_service.create_session(
-            app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
-        )
-
-        phase4_runner = Runner(
-            app_name=APP_NAME,
-            agent=report_generator_agent,
-            session_service=session_service,
-        )
-
-        print("\n[PIPELINE] Generating preprocessing report...\n", flush=True)
-
-        response = None
-        for phase4_attempt in range(3):
-            if phase4_attempt > 0:
-                print(f"\n[PIPELINE] Retrying Phase 4 (attempt {phase4_attempt + 1}/3)...", flush=True)
-                await asyncio.sleep(10)
-                SESSION_PHASE4 = f"session_phase4_retry{phase4_attempt}"
-                await session_service.create_session(
-                    app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_PHASE4
-                )
-                phase4_runner = Runner(
-                    app_name=APP_NAME,
-                    agent=report_generator_agent,
-                    session_service=session_service,
-                )
-            try:
-                response = await asyncio.wait_for(
-                    run_agent_turn(
-                        phase4_runner, USER_ID, SESSION_PHASE4,
-                        "Generate the comprehensive preprocessing report for this ML project.",
-                    ),
-                    timeout=PHASE4_TIMEOUT if PHASE4_TIMEOUT > 0 else None,
-                )
-            except asyncio.TimeoutError as e:
-                _write_crash_log(
-                    f"Phase 4 attempt {phase4_attempt + 1}",
-                    e,
-                    {"timeout_seconds": PHASE4_TIMEOUT},
-                )
-                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} timed out.", flush=True)
-                response = None
-            except Exception as e:
-                _write_crash_log(f"Phase 4 attempt {phase4_attempt + 1}", e)
-                print(f"\n[WARN] Phase 4 attempt {phase4_attempt + 1} error: {e}", flush=True)
-                response = None
-
-            if response is not None:
-                break
-
-        if response is None:
-            _write_crash_log("Phase 4", RuntimeError("All 3 attempts failed"), {})
-            print("\n[ERROR] Report generation failed after 3 attempts.")
-        else:
-            mark_checkpoint("phase4_complete")
-            backup_state()
-            print("\n[PIPELINE] Phase 4 complete — preprocessing report saved!")
 
     # ==============================================================
     # PHASE 5: Machine Learning (autonomous)
