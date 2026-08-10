@@ -484,20 +484,51 @@ a new file, which is what makes the output usable rather than just present.
 
 ---
 
-## 6. Open items to decide before M4
+## 6. Resolved decisions
 
-1. **Vision dataset ceiling** — cap by rows, GB, or wall-clock? Affects whether subsampling
-   is automatic or prompted.
-2. **Host-venv training consent** — one-time global opt-in during `init`, or per-run
-   confirmation? (Recommend: per-run, since it's the only path that drops isolation.)
-3. **Colab's role now that JarvisLabs and RunPod are in** — both are strictly better
-   behaved (real APIs, real teardown, predictable billing). Recommend demoting Colab to
-   "supported if configured, never auto-selected", or dropping it entirely rather than
-   maintaining a third remote path.
-4. **Default disposition on run completion** — PAUSE (fast resume, storage still bills) or
-   DESTROY (zero residual cost, cold start next time)? Recommend DESTROY by default with
-   `--keep-warm` to opt into PAUSE.
-5. **Cost ceiling default** — should `--max-cost-usd` have a non-zero default (e.g. $5) so
-   an unattended run can never surprise you, or default to unlimited with explicit opt-in?
-6. **Model registry** — do repeated runs on the same dataset accumulate a comparable history,
-   or is each run standalone?
+Settled 2026-08-10. These are no longer open — they are requirements.
+
+| # | Decision | Resolution |
+|---|---|---|
+| 1 | Cost ceiling | `--max-cost-usd` defaults to **$5**. The ceiling and the estimated cost are **shown to the user before the remote run starts**, not buried in a log. |
+| 2 | Disposition on completion | **DESTROY** by default; `--keep-warm` opts into PAUSE. |
+| 3 | No local GPU | **Ask, don't assume** — see below. |
+| 4 | Host-venv consent | **Per-run** confirmation. |
+| 5 | Vision dataset ceiling | **GB cap with a prompt** before subsampling. |
+| 6 | Model registry | **Standalone runs** for now; revisit after M7. |
+
+### 6.1 The no-GPU flow (revised)
+
+Colab is *not* demoted. When `doctor` finds no usable local GPU, the CLI asks the user which
+compute they actually have access to, rather than silently picking a tier:
+
+```
+No local GPU detected (CPU-only training would take ~4h for this plan).
+
+  Where should training run?
+    1  JarvisLabs        (cloud GPU — needs JL_API_KEY)
+    2  RunPod            (cloud GPU — needs RUNPOD_API_KEY)
+    3  Google Colab      (free tier via colab-mcp)
+    4  Local CPU anyway  (slower, reduced budget, stays fully local)
+
+  Estimated cost ceiling for options 1-2: $5.00  (change with --max-cost-usd)
+```
+
+Providers already configured during `prompt2ml init` are marked as ready; unconfigured ones
+show the exact setup step inline. The choice is remembered per run and recorded in the final
+report. `--backend` skips the prompt entirely for unattended use; `--local-only` removes
+options 1-3.
+
+This means all three remote backends are first-class and must be implemented from their
+**actual documentation** — JarvisLabs' `jl` CLI, RunPod's Python SDK, and the colab-mcp
+repository's own docs — rather than from recalled API shapes. Each adapter carries a
+contract test that exercises create → run → fetch logs → download → teardown against the
+real provider, run manually with a cost cap.
+
+## 7. Open items to decide before M4
+
+1. **Colab GPU-class detection** — the free tier hands out whatever it has (T4 / L4 / none).
+   Does the budget adapt after the runtime attaches, or do we plan conservatively for T4?
+2. **Interrupted remote runs** — checkpoint cadence for spot/interruptible instances is a
+   cost/robustness tradeoff. Per-epoch is safe but slow on small datasets.
+3. **Multi-GPU** — out of scope through M7, or does RunPod's `gpu_count` get plumbed through?

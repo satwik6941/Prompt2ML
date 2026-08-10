@@ -86,9 +86,29 @@ def scan_datasets_folder() -> str:
     if not DATASETS_DIR.exists():
         return json.dumps({"error": f"Datasets folder not found: {DATASETS_DIR}"})
 
+    # datasets/ is shared across every run, so an unscoped scan lets this project
+    # select a dataset downloaded for a completely different one. When the current
+    # run recorded what it downloaded, restrict the scan to that folder.
+    state = load_state()
+    downloaded = state.get("downloaded_dataset", {})
+    run_folder = ""
+    if isinstance(downloaded, dict):
+        run_folder = Path(downloaded.get("path", "")).name
+
+    candidate_folders = sorted(f for f in DATASETS_DIR.iterdir() if f.is_dir())
+    scoped = [f for f in candidate_folders if f.name == run_folder] if run_folder else []
+    if scoped:
+        candidate_folders = scoped
+    elif run_folder:
+        print(
+            f"[PIPELINE WARNING] This run downloaded '{run_folder}' but it is missing from "
+            f"{DATASETS_DIR}. Falling back to scanning every dataset folder.",
+            flush=True,
+        )
+
     folder_summaries = []
 
-    for folder in sorted(DATASETS_DIR.iterdir()):
+    for folder in candidate_folders:
         if not folder.is_dir():
             continue
 
@@ -617,6 +637,70 @@ def _safe_read_csv(path: str):
     return None, err
 
 
+def record_deferred_transform(kind: str, column: str, method: str, reason: str) -> None:
+    """
+    Record a transform that must be fitted INSIDE the ML training pipeline
+    (on training folds only) rather than here at preprocessing time.
+
+    Any transform that learns a statistic from the data — an imputation mean,
+    a category frequency map, a scaler's variance — leaks information from the
+    held-out rows into the features when it is fitted on the full dataset. The
+    resulting metrics are optimistic by an unknown margin, and no amount of
+    downstream auditing can recover the true number.
+
+    Entries accumulate under the 'deferred_transforms' state key. The ML trainer
+    reads them and rebuilds each one inside a sklearn Pipeline; the preprocessing
+    validator reads them to know which columns are *supposed* to still hold nulls.
+    """
+    state = load_state()
+    deferred = state.get("deferred_transforms", [])
+    if not isinstance(deferred, list):
+        deferred = []
+    entry = {"kind": kind, "column": column, "method": method, "reason": reason}
+    if entry not in deferred:
+        deferred.append(entry)
+    save_state({"deferred_transforms": deferred})
+
+
+def get_deferred_transforms() -> str:
+    """
+    Return every transform deferred to the ML training pipeline, as JSON.
+
+    Call this to find out which columns are intentionally left un-imputed or
+    un-encoded in the preprocessed dataset. Nulls in these columns are expected
+    and must NOT be reported as a preprocessing failure.
+    """
+    state = load_state()
+    deferred = state.get("deferred_transforms", [])
+    return json.dumps({
+        "deferred_transforms": deferred,
+        "columns_with_expected_nulls": sorted({
+            d.get("column", "") for d in deferred
+            if isinstance(d, dict) and d.get("kind") == "imputation"
+        } - {""}),
+        "note": (
+            "These are fitted inside the ML training Pipeline on training folds only. "
+            "Nulls remaining in the listed columns are intentional and leakage-safe."
+        ),
+    }, indent=2)
+
+
+# Imputation strategies that fit a statistic across the whole column. Applying
+# these before the train/test split leaks held-out information into the features.
+_FITTED_IMPUTATIONS = {
+    "fill_mean": "SimpleImputer(strategy='mean')",
+    "fill_median": "SimpleImputer(strategy='median')",
+    "fill_mode": "SimpleImputer(strategy='most_frequent')",
+}
+
+# Row-local strategies — each output depends only on that row or on earlier rows
+# in the same series, so there is nothing to leak.
+_ROW_LOCAL_IMPUTATIONS = {
+    "fill_zero", "fill_ffill", "fill_bfill", "fill_interpolate",
+    "drop_rows", "drop_column",
+}
+
+
 def _safe_write_csv(df, output_path: str) -> str | None:
     """
     Write a DataFrame to CSV or Parquet (chosen by the output_path extension)
@@ -678,8 +762,15 @@ def handle_missing_values(
             Supported strategies: fill_mean, fill_median, fill_mode, fill_zero,
             fill_ffill, fill_bfill, fill_interpolate, drop_rows, drop_column.
 
+            LEAKAGE NOTE: fill_mean / fill_median / fill_mode learn a statistic from
+            the whole column. Those are NOT applied here — they are recorded as
+            deferred and rebuilt inside the ML training Pipeline, fitted on training
+            folds only. The column keeps its nulls on purpose; that is not a failure.
+            Row-local strategies (fill_zero, ffill, bfill, interpolate, drop_rows,
+            drop_column) are applied immediately because they cannot leak.
+
     Returns:
-        JSON with before/after missing counts and rows affected.
+        JSON with before/after missing counts, rows affected, and deferred strategies.
     """
     import pandas as pd
 
@@ -696,6 +787,7 @@ def handle_missing_values(
     before_missing = df.isnull().sum().to_dict()
     before_rows = len(df)
     warnings = []
+    deferred = {}
 
     strategies, err = _parse_json_param(strategy_json, "strategy_json")
     if err:
@@ -704,22 +796,21 @@ def handle_missing_values(
     for col, strategy in strategies.items():
         if col not in df.columns:
             continue
-        if strategy == "fill_mean":
-            mean_val = df[col].mean()
-            if pd.isna(mean_val):
-                warnings.append(f"{col}: fill_mean skipped — column is entirely null (mean is NaN)")
-                continue
-            df[col] = df[col].fillna(mean_val)
-        elif strategy == "fill_median":
-            median_val = df[col].median()
-            if pd.isna(median_val):
-                warnings.append(f"{col}: fill_median skipped — column is entirely null")
-                continue
-            df[col] = df[col].fillna(median_val)
-        elif strategy == "fill_mode":
-            mode_val = df[col].mode()
-            if len(mode_val) > 0:
-                df[col] = df[col].fillna(mode_val[0])
+        if strategy in _FITTED_IMPUTATIONS:
+            # Fitting mean/median/mode across the full column would leak held-out
+            # rows into the features. Record it for the training Pipeline instead.
+            sklearn_equivalent = _FITTED_IMPUTATIONS[strategy]
+            record_deferred_transform(
+                kind="imputation",
+                column=col,
+                method=sklearn_equivalent,
+                reason=(
+                    f"'{strategy}' fits a statistic over the whole column; applying it "
+                    "before the train/test split leaks held-out data into the features."
+                ),
+            )
+            deferred[col] = sklearn_equivalent
+            continue
         elif strategy == "fill_zero":
             df[col] = df[col].fillna(0)
         elif strategy == "fill_ffill":
@@ -732,6 +823,11 @@ def handle_missing_values(
             df = df.dropna(subset=[col])
         elif strategy == "drop_column":
             df = df.drop(columns=[col])
+        else:
+            warnings.append(
+                f"{col}: unknown strategy '{strategy}' — skipped. Supported: "
+                f"{sorted(set(_FITTED_IMPUTATIONS) | _ROW_LOCAL_IMPUTATIONS)}"
+            )
 
     write_err = _safe_write_csv(df, output_path)
     if write_err:
@@ -745,6 +841,12 @@ def handle_missing_values(
         "after_missing": {k: v for k, v in after_missing.items() if v > 0},
         "rows_before": before_rows,
         "rows_after": len(df),
+        "deferred_to_training_pipeline": deferred,
+        "deferred_note": (
+            "Nulls remain in the deferred columns ON PURPOSE — the ML trainer imputes them "
+            "inside a Pipeline fitted on training folds only. Do NOT re-run imputation on "
+            "them here, and do NOT treat those nulls as a validation failure."
+        ) if deferred else "",
         "warnings": warnings,
         "output_path": output_path,
     }, indent=2)
@@ -922,9 +1024,27 @@ def encode_categorical_columns(
             details[col] = {"method": "onehot", "new_columns": list(dummies.columns)}
 
         elif method == "frequency":
-            freq_map = df[col].value_counts(normalize=True).to_dict()
-            df[col] = df[col].map(freq_map)
-            details[col] = {"method": "frequency", "top_mappings": dict(list(freq_map.items())[:5])}
+            # A frequency map built from the full column encodes the held-out rows'
+            # category distribution into the training features. category_encoders'
+            # CountEncoder does the same job inside the training Pipeline, fitted
+            # on training folds only (it ships in the sandbox image).
+            record_deferred_transform(
+                kind="encoding",
+                column=col,
+                method="category_encoders.CountEncoder(normalize=True)",
+                reason=(
+                    "frequency encoding fitted on the full column leaks the held-out "
+                    "category distribution into the features."
+                ),
+            )
+            details[col] = {
+                "status": "deferred",
+                "method": "category_encoders.CountEncoder(normalize=True)",
+                "reason": (
+                    "Deferred to the ML training Pipeline so the counts are fitted on "
+                    "training folds only. Column left unencoded on purpose."
+                ),
+            }
 
         elif method.startswith("ordinal:"):
             order = method.split(":", 1)[1].split(",")
@@ -1531,9 +1651,24 @@ def process_text_columns(
 
             elif method.startswith("hash:"):
                 n_buckets = int(method.split(":")[1])
-                df[f"{col}_hash"] = df[col].astype(str).apply(lambda x: hash(x) % n_buckets)
+                # Python's built-in hash() is salted per process (PYTHONHASHSEED),
+                # so the same input produces different buckets on every run. Use a
+                # stable digest instead — a model trained on one run's buckets must
+                # still score correctly on the next run's.
+                import hashlib
+
+                def _stable_bucket(value: str, buckets: int = n_buckets) -> int:
+                    digest = hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest()
+                    return int.from_bytes(digest, "big") % buckets
+
+                df[f"{col}_hash"] = df[col].astype(str).map(_stable_bucket)
                 df = df.drop(columns=[col])
-                details[col] = {"status": "success", "new_columns": [f"{col}_hash"], "n_buckets": n_buckets}
+                details[col] = {
+                    "status": "success",
+                    "new_columns": [f"{col}_hash"],
+                    "n_buckets": n_buckets,
+                    "hash": "blake2b (stable across processes and runs)",
+                }
 
             elif method == "drop":
                 df = df.drop(columns=[col])
@@ -1595,6 +1730,7 @@ def detect_and_fix_data_types(
             continue
 
         before_type = str(df[col].dtype)
+        conversion_warning = ""
         try:
             if target_type == "int":
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
@@ -1603,13 +1739,39 @@ def detect_and_fix_data_types(
             elif target_type == "str":
                 df[col] = df[col].astype(str)
             elif target_type == "bool":
-                df[col] = df[col].astype(bool)
+                # A bare astype(bool) maps every non-empty string to True, so the
+                # strings "False", "no" and "0" all silently become True. Map the
+                # known truthy/falsy spellings explicitly and leave the rest null.
+                # pandas 3 reads text columns as the `str` dtype rather than
+                # `object`, so an `== object` check silently misses them and falls
+                # through to astype("boolean"), which rejects the strings outright.
+                if (pd.api.types.is_object_dtype(df[col])
+                        or pd.api.types.is_string_dtype(df[col])):
+                    normalized = df[col].astype(str).str.strip().str.lower()
+                    truthy = {"true", "t", "yes", "y", "1"}
+                    falsy = {"false", "f", "no", "n", "0", "", "nan", "none", "null"}
+                    mapped = normalized.map(
+                        lambda v: True if v in truthy else (False if v in falsy else None)
+                    )
+                    unmapped = int(mapped.isnull().sum() - df[col].isnull().sum())
+                    df[col] = mapped.astype("boolean")
+                    if unmapped > 0:
+                        conversion_warning = (
+                            f"{unmapped} value(s) matched neither the truthy nor falsy "
+                            "spellings and became null."
+                        )
+                else:
+                    df[col] = df[col].astype("boolean")
             elif target_type == "datetime":
                 df[col] = pd.to_datetime(df[col], errors="coerce")
             elif target_type == "category":
                 df[col] = df[col].astype("category")
             elif target_type == "auto":
-                df[col] = pd.to_numeric(df[col], errors="ignore")
+                # errors="ignore" was deprecated in pandas 2.2 and removed in 3.0.
+                # Convert where the whole column parses cleanly; otherwise leave it.
+                converted = pd.to_numeric(df[col], errors="coerce")
+                if converted.isnull().sum() == df[col].isnull().sum():
+                    df[col] = converted
 
             details[col] = {
                 "status": "converted",
@@ -1617,6 +1779,8 @@ def detect_and_fix_data_types(
                 "to": str(df[col].dtype),
                 "nulls_after": int(df[col].isnull().sum()),
             }
+            if conversion_warning:
+                details[col]["warning"] = conversion_warning
         except Exception as e:
             details[col] = {"status": "error", "from": before_type, "reason": str(e)}
 
@@ -1677,17 +1841,41 @@ def validate_dataset(
     results = {}
     all_passed = True
 
+    # Columns whose imputation was deliberately deferred to the training Pipeline
+    # still hold nulls by design. Failing them here would send Agent 3 into a retry
+    # loop trying to "fix" the leakage-safe behaviour we just introduced.
+    deferred_state = load_state().get("deferred_transforms", [])
+    deferred_null_cols = {
+        d.get("column", "") for d in deferred_state
+        if isinstance(d, dict) and d.get("kind") == "imputation"
+    } - {""}
+    if deferred_null_cols:
+        results["_deferred_columns"] = {
+            "columns": sorted(deferred_null_cols),
+            "note": "nulls expected here — imputed inside the ML training Pipeline",
+        }
+
     if checks.get("no_nulls"):
-        null_cols = {col: int(v) for col, v in df.isnull().sum().items() if v > 0}
+        null_cols = {
+            col: int(v) for col, v in df.isnull().sum().items()
+            if v > 0 and col not in deferred_null_cols
+        }
         passed = len(null_cols) == 0
-        results["no_nulls"] = {"passed": passed, "null_columns": null_cols}
+        results["no_nulls"] = {
+            "passed": passed,
+            "null_columns": null_cols,
+            "ignored_deferred": sorted(deferred_null_cols & set(df.columns)),
+        }
         if not passed:
             all_passed = False
 
     if "max_null_pct" in checks:
         max_pct = checks["max_null_pct"]
         pct = (df.isnull().sum() / len(df) * 100).round(2)
-        bad_cols = {col: float(v) for col, v in pct.items() if v > max_pct}
+        bad_cols = {
+            col: float(v) for col, v in pct.items()
+            if v > max_pct and col not in deferred_null_cols
+        }
         passed = len(bad_cols) == 0
         results["max_null_pct"] = {"passed": passed, "threshold": max_pct, "violations": bad_cols}
         if not passed:
@@ -1983,6 +2171,18 @@ async def run_plan_aware_validation(
     sandbox_log = state.get("agent3_sandbox_log", [])
     iteration = state.get("loop_iteration", 0)
 
+    def lit(value) -> str:
+        """
+        Render a value as a safe Python literal for the generated script.
+
+        Plan fields are LLM-written prose. Interpolating them straight into a
+        quoted string literal means one apostrophe or newline turns the whole
+        validation script into a SyntaxError — and the failure surfaces as the
+        useless "script failed", never as "your plan had a quote in it".
+        json.dumps produces a correctly escaped literal that is also valid Python.
+        """
+        return json.dumps("" if value is None else str(value))
+
     # With SafeExecute, modified_datasets/ IS /workspace — no upload needed
     orig_sandbox = f"/workspace/{Path(original_path).name}"
     pre_sandbox = f"/workspace/{Path(preprocessed_path).name}"
@@ -2006,7 +2206,7 @@ results['dupes_preprocessed'] = int(pre.duplicated().sum())
         checks.append(f"""
 # Check: duplicates were actually removed
 dup_check = {{}}
-dup_check['planned'] = '{dup_strategy}'
+dup_check['planned'] = {lit(dup_strategy)}
 dup_check['dupes_before'] = int(orig.duplicated().sum())
 dup_check['dupes_after'] = int(pre.duplicated().sum())
 dup_check['rows_removed'] = len(orig) - len(pre)
@@ -2020,7 +2220,7 @@ results['check_drop_duplicates'] = dup_check
         checks.append(f"""
 # Check: missing values were reduced
 missing_check = {{}}
-missing_check['planned'] = '{missing_strategy}'
+missing_check['planned'] = {lit(missing_strategy)}
 missing_check['nulls_before'] = int(orig.isnull().sum().sum())
 missing_check['nulls_after'] = int(pre.isnull().sum().sum())
 missing_check['passed'] = pre.isnull().sum().sum() <= orig.isnull().sum().sum()
@@ -2049,7 +2249,7 @@ results['check_drop_columns'] = drop_check
     if scaling_strategy and scaling_strategy.lower() not in ("none", ""):
         checks.append(f"""
 results['scaling_deferred_to_training'] = {{
-    'planned_for_training_pipeline': '''{str(scaling_strategy)[:200]}''',
+    'planned_for_training_pipeline': {lit(str(scaling_strategy)[:200])},
     'note': 'Data is intentionally unscaled here; the ML trainer scales inside a Pipeline fit on train data only.'
 }}
 """)
@@ -2065,24 +2265,24 @@ results['scaling_deferred_to_training'] = {{
                 checks.append(f"""
 enc_check = {{}}
 enc_check['planned'] = 'onehot'
-enc_check['col'] = '{col}'
-enc_check['original_col_gone'] = '{col}' not in pre.columns
-enc_check['dummy_cols_present'] = [c for c in pre.columns if c.startswith('{col}_')]
-enc_check['passed'] = '{col}' not in pre.columns and len(enc_check['dummy_cols_present']) > 0
-results['check_encode_{col}_onehot'] = enc_check
+enc_check['col'] = {lit(col)}
+enc_check['original_col_gone'] = {lit(col)} not in pre.columns
+enc_check['dummy_cols_present'] = [c for c in pre.columns if c.startswith({lit(col + '_')})]
+enc_check['passed'] = {lit(col)} not in pre.columns and len(enc_check['dummy_cols_present']) > 0
+results[{lit('check_encode_' + col + '_onehot')}] = enc_check
 """)
             elif method in ("label", "binary"):
                 checks.append(f"""
 enc_check = {{}}
-enc_check['planned'] = '{method}'
-enc_check['col'] = '{col}'
-if '{col}' in pre.columns:
-    enc_check['dtype'] = str(pre['{col}'].dtype)
-    enc_check['passed'] = str(pre['{col}'].dtype) in ('int64', 'int32', 'float64', 'int8')
+enc_check['planned'] = {lit(method)}
+enc_check['col'] = {lit(col)}
+if {lit(col)} in pre.columns:
+    enc_check['dtype'] = str(pre[{lit(col)}].dtype)
+    enc_check['passed'] = str(pre[{lit(col)}].dtype) in ('int64', 'int32', 'float64', 'int8')
 else:
     enc_check['passed'] = False
     enc_check['reason'] = 'column not found'
-results['check_encode_{col}_{method}'] = enc_check
+results[{lit('check_encode_' + col + '_' + method)}] = enc_check
 """)
 
     # outlier_strategy — accepts JSON dict or legacy "col:method,col:method"
@@ -2093,17 +2293,17 @@ results['check_encode_{col}_{method}'] = enc_check
             if not method or method in ("none", "keep"):
                 continue
             checks.append(f"""
-if '{col}' in orig.columns and '{col}' in pre.columns:
-    q1 = float(orig['{col}'].quantile(0.25))
-    q3 = float(orig['{col}'].quantile(0.75))
+if {lit(col)} in orig.columns and {lit(col)} in pre.columns:
+    q1 = float(orig[{lit(col)}].quantile(0.25))
+    q3 = float(orig[{lit(col)}].quantile(0.75))
     iqr = q3 - q1
     expected_upper = q3 + 1.5 * iqr
     expected_lower = q1 - 1.5 * iqr
-    actual_max = float(pre['{col}'].max())
-    actual_min = float(pre['{col}'].min())
-    results['check_outlier_{col}'] = {{
-        'planned': '{method}',
-        'original_max': round(float(orig['{col}'].max()), 4),
+    actual_max = float(pre[{lit(col)}].max())
+    actual_min = float(pre[{lit(col)}].min())
+    results[{lit('check_outlier_' + col)}] = {{
+        'planned': {lit(method)},
+        'original_max': round(float(orig[{lit(col)}].max()), 4),
         'preprocessed_max': round(actual_max, 4),
         'expected_upper_bound': round(expected_upper, 4),
         'passed': actual_max <= expected_upper * 1.05
@@ -2115,7 +2315,7 @@ if '{col}' in orig.columns and '{col}' in pre.columns:
     if feat_engineering and feat_engineering.lower() not in ("none", ""):
         checks.append(f"""
 feat_check = {{}}
-feat_check['planned'] = '{feat_engineering[:100]}'
+feat_check['planned'] = {lit(feat_engineering[:100])}
 feat_check['cols_added'] = len(pre.columns) - len(orig.columns)
 feat_check['passed'] = len(pre.columns) > len(orig.columns)
 results['check_feature_engineering'] = feat_check
@@ -2126,7 +2326,7 @@ results['check_feature_engineering'] = feat_check
     if datetime_processing and datetime_processing.lower() not in ("none", ""):
         checks.append(f"""
 dt_check = {{}}
-dt_check['planned'] = '{datetime_processing[:100]}'
+dt_check['planned'] = {lit(datetime_processing[:100])}
 dt_check['cols_added'] = len(pre.columns) - len(orig.columns)
 dt_check['passed'] = len(pre.columns) > len(orig.columns)
 results['check_datetime_processing'] = dt_check
@@ -2135,17 +2335,20 @@ results['check_datetime_processing'] = dt_check
     # Sandbox log checks — verify each custom sandbox step
     current_iter_logs = [s for s in sandbox_log if s.get("iteration") == iteration]
     for log_entry in current_iter_logs:
+        # step_name came from the LLM and was previously spliced in as a Python
+        # *identifier*. A space, hyphen or digit-first name produced a SyntaxError
+        # that surfaced only as "validation script failed". Keep it as dict data.
         step_name = log_entry.get("step_name", "unknown")
         purpose = log_entry.get("purpose", "")
         stdout = log_entry.get("stdout", "")
         checks.append(f"""
-sandbox_check_{step_name} = {{}}
-sandbox_check_{step_name}['step'] = '{step_name}'
-sandbox_check_{step_name}['purpose'] = '''{purpose[:100]}'''
-sandbox_check_{step_name}['stdout_preview'] = '''{stdout[:200]}'''
-sandbox_check_{step_name}['rows_after'] = len(pre)
-sandbox_check_{step_name}['passed'] = len(pre) > 0
-results['check_sandbox_{step_name}'] = sandbox_check_{step_name}
+_sandbox_check = {{}}
+_sandbox_check['step'] = {lit(step_name)}
+_sandbox_check['purpose'] = {lit(purpose[:100])}
+_sandbox_check['stdout_preview'] = {lit(stdout[:200])}
+_sandbox_check['rows_after'] = len(pre)
+_sandbox_check['passed'] = len(pre) > 0
+results[{lit('check_sandbox_' + str(step_name))}] = _sandbox_check
 """)
 
     # Ensure original dataset is visible inside the sandbox workspace.
@@ -2664,6 +2867,10 @@ TOOL SELECTION GUIDE FOR PLAN STEPS
 - handle_outliers → handle_outliers tool
 - encode_categoricals → encode_categorical_columns tool
 - feature_engineering → engineer_features tool
+- handle_missing → handle_missing_values tool. NOTE: fill_mean / fill_median /
+  fill_mode are recorded as deferred and NOT applied — the column keeps its nulls
+  on purpose. That is success, not failure. Do not retry them and do not
+  substitute fill_zero to make the nulls disappear.
 - scale_numerics → DO NOT EXECUTE. Scaling is deferred to the ML training
   pipeline (fit on train data only) to prevent leakage. If the plan still
   contains a scale_numerics step, skip it and note "scaling deferred to
@@ -2711,6 +2918,7 @@ HANDLING PLAN-DATA MISMATCHES (CRITICAL — do NOT stall):
     tools=[
         get_preprocessing_resume_state,
         get_preprocessing_context,
+        get_deferred_transforms,
         # Built-in preprocessing tools
         handle_missing_values,
         remove_duplicates,
@@ -2774,8 +2982,15 @@ PRIMARY — Plan-aware checks (from run_plan_aware_validation checklist, if avai
 - If any check is FAILED, that is a specific issue for Agent 3 to fix
 - Use the checklist's evidence (actual numbers) in your feedback — not vague descriptions
 
+DEFERRED TRANSFORMS — read this before judging nulls:
+Call get_deferred_transforms(). Any column listed there is intentionally left
+un-imputed or un-encoded so the ML trainer can fit it on training folds only.
+Nulls in those columns are CORRECT. Never fail the run for them, and never tell
+Agent 3 to impute them — doing so reintroduces the exact data leakage the
+deferral exists to prevent.
+
 SECONDARY — Structural checks (from validate_dataset, always run):
-- No null values remain (unless the plan explicitly allows it)
+- No null values remain, EXCEPT in deferred columns (see above)
 - No duplicate rows remain
 - No infinite values in numeric columns
 - Row count hasn't dropped by more than 20%
@@ -2812,6 +3027,7 @@ RULES:
 """,
     tools=[
         load_validation_context,
+        get_deferred_transforms,
         # Plan-aware sandbox validation
         start_sandbox,
         stop_sandbox,

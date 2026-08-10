@@ -28,7 +28,6 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "data_preprocessing_agent"))
 
 from pipeline_state import (
     load_state, save_state, get_run_dir, get_outputs_dir,
@@ -267,8 +266,12 @@ def save_ml_training_plan(
 # ============================================================
 
 # Reuse the sandbox executor from data_preprocessing_agent
+# Import through the package path, NOT the bare module name. Importing it both
+# ways creates two distinct module objects with independent _container/_started/
+# WORKSPACE globals, so the ML phase could believe the sandbox was stopped while
+# the preprocessing phase still held it (and vice versa).
 try:
-    from sandbox_executor import (
+    from data_preprocessing_agent.sandbox_executor import (
         start_sandbox,
         stop_sandbox,
         run_in_sandbox,
@@ -470,11 +473,18 @@ def get_ml_plan_for_trainer() -> str:
         "ml_plan_content": state.get("ml_plan_content", ""),
         "preprocessed_dataset_path": state.get("preprocessed_dataset_path", ""),
         "preprocessing_plan": _latest_preprocessing_plan(state),
+        "deferred_transforms": state.get("deferred_transforms", []),
         "deferred_transforms_note": (
-            "The preprocessed dataset is intentionally UNSCALED and any "
-            "'target_encode_deferred' columns are un-encoded. Apply the plan's "
-            "scaling_strategy / deferred target encoding INSIDE your sklearn "
-            "Pipeline so they fit on training data only."
+            "The preprocessed dataset is intentionally INCOMPLETE — this is by design, "
+            "not a preprocessing bug. Every entry in 'deferred_transforms' is a step that "
+            "would leak held-out data if it were fitted before the split, so it was left "
+            "for you. Rebuild each one INSIDE your sklearn Pipeline (via ColumnTransformer "
+            "where it applies to a subset of columns) so it fits on training folds only:\n"
+            "  kind='imputation' → the named SimpleImputer, e.g. SimpleImputer(strategy='median')\n"
+            "  kind='encoding'   → the named encoder (TargetEncoder, category_encoders.CountEncoder)\n"
+            "  scaling           → the plan's scaling_strategy scaler\n"
+            "Nulls in the deferred columns are EXPECTED. Do NOT fillna() them before the "
+            "split, and do NOT drop those rows — the imputer inside the Pipeline handles them."
         ),
         "ml_validation_feedback": state.get("ml_validation_feedback", ""),
         "ml_validation_iterations": state.get("ml_validation_iterations", []),

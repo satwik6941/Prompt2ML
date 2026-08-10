@@ -33,7 +33,9 @@ ERROR HANDLING:
 
 import ast
 import json
+import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -58,6 +60,24 @@ _started: bool = False
 # Docker image and container name
 _IMAGE_NAME = "prompt2ml-sandbox:latest"
 _CONTAINER_NAME = "prompt2ml-pipeline"
+
+# ---------------------------------------------------------------------------
+# Resource limits. LLM-generated code runs in here; an unbounded container can
+# exhaust host RAM or spin forever. Override via environment for big machines.
+# ---------------------------------------------------------------------------
+
+# Wall-clock ceiling for a single exec. Without this a runaway script hangs
+# until the phase timeout, and the container survives even that.
+DEFAULT_EXEC_TIMEOUT_S = int(os.getenv("PROMPT2ML_EXEC_TIMEOUT", "1800"))
+
+# Memory ceiling. Docker kills the process (exit 137) rather than the host swapping.
+CONTAINER_MEM_LIMIT = os.getenv("PROMPT2ML_SANDBOX_MEM", "8g")
+
+# CPU ceiling, in whole cores.
+CONTAINER_CPUS = float(os.getenv("PROMPT2ML_SANDBOX_CPUS", "4"))
+
+# Process-count ceiling — stops a fork bomb from taking the host down with it.
+CONTAINER_PIDS_LIMIT = int(os.getenv("PROMPT2ML_SANDBOX_PIDS", "512"))
 
 # ---------------------------------------------------------------------------
 # Import → pip package name mapping
@@ -128,13 +148,56 @@ def _ensure_workspace() -> str:
     return str(run_dir)
 
 
+def _same_path(a: str, b: str) -> bool:
+    """
+    Compare two host paths for equality across the spellings Docker reports.
+
+    Docker Desktop on Windows may hand back `/host_mnt/c/...` or `C:\\...` for the
+    same directory depending on the backend, so a plain string compare produces
+    false mismatches and needlessly rebuilds the container.
+    """
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+
+    def norm(p: str) -> str:
+        p = p.replace("\\", "/").rstrip("/").lower()
+        for prefix in ("/host_mnt/", "/mnt/", "/run/desktop/mnt/host/"):
+            if p.startswith(prefix):
+                rest = p[len(prefix):]
+                if len(rest) > 1 and rest[1] == "/":       # "c/users/..." -> "c:/users/..."
+                    rest = f"{rest[0]}:{rest[1:]}"
+                return rest
+        return p
+
+    return norm(a) == norm(b)
+
+
 def _is_docker_daemon_error(exc: Exception) -> bool:
-    """Detect whether the exception means the Docker daemon isn't reachable."""
+    """
+    Detect whether the exception means the Docker daemon isn't reachable.
+
+    Deliberately narrow: matching a bare "docker" substring made every unrelated
+    failure inside a docker-sdk call report itself as "Docker Desktop is not
+    running", which sends the user off fixing the wrong thing.
+    """
+    import errno
+
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, OSError) and exc.errno in (errno.ECONNREFUSED, errno.ENOENT, errno.EPIPE):
+        return True
+
     msg = str(exc).lower()
     return any(k in msg for k in (
-        "pipe", "createfile", "cannot find the file", "docker",
-        "connection refused", "fetching server api", "is the docker daemon running",
-        "error while fetching", "2375", "named pipe",
+        "is the docker daemon running",
+        "error while fetching server api version",
+        "cannot connect to the docker daemon",
+        "connection refused",
+        "the system cannot find the file specified",   # Windows named-pipe absence
+        "//./pipe/docker_engine",
+        "dockerdesktoplinuxengine",
     ))
 
 
@@ -198,19 +261,59 @@ def _get_client():
         raise exc
 
 
-def _exec_in_container(cmd: list[str], workdir: str = "/workspace"):
+class SandboxTimeout(Exception):
+    """Raised when a container exec exceeds its wall-clock budget."""
+
+
+def _exec_in_container(
+    cmd: list[str],
+    workdir: str = "/workspace",
+    timeout_s: int | None = None,
+    user: str | None = None,
+):
     """
     Run a command inside the running container and return (exit_code, output).
     `output` is a single string combining stdout and stderr.
+
+    docker-py's exec_run has no timeout parameter, so the call is run on a worker
+    thread and abandoned if it overruns. Abandoning the thread is not enough on its
+    own — the process inside the container keeps burning CPU — so on timeout we
+    also kill the matching PIDs in the container before raising.
     """
     if _container is None:
         raise RuntimeError("Container is not started. Call start_sandbox() first.")
-    result = _container.exec_run(
-        cmd,
-        stdout=True,
-        stderr=True,
-        workdir=workdir,
-    )
+
+    budget = DEFAULT_EXEC_TIMEOUT_S if timeout_s is None else timeout_s
+    box: dict = {}
+
+    def _call():
+        try:
+            box["result"] = _container.exec_run(
+                cmd, stdout=True, stderr=True, workdir=workdir, user=user or "",
+            )
+        except Exception as exc:  # surfaced on the calling thread below
+            box["error"] = exc
+
+    worker = threading.Thread(target=_call, daemon=True)
+    worker.start()
+    worker.join(timeout=budget if budget > 0 else None)
+
+    if worker.is_alive():
+        # Best-effort kill so the abandoned process stops consuming the container.
+        try:
+            _container.exec_run(["pkill", "-9", "-f", cmd[-1]], stdout=False, stderr=False)
+        except Exception:
+            pass
+        raise SandboxTimeout(
+            f"Execution exceeded {budget}s and was terminated. "
+            "Reduce the work per step, sample the data, or raise "
+            "PROMPT2ML_EXEC_TIMEOUT if the job genuinely needs longer."
+        )
+
+    if "error" in box:
+        raise box["error"]
+
+    result = box["result"]
     output = result.output.decode("utf-8", errors="replace") if result.output else ""
     return result.exit_code, output
 
@@ -239,7 +342,7 @@ def _check_and_install_deps(imports: list[str]) -> dict:
     missing_pip: list[str] = []
     for name in candidates:
         exit_code, _ = _exec_in_container(
-            ["python", "-c", f"import {name}"]
+            ["python", "-c", f"import {name}"], timeout_s=60
         )
         if exit_code != 0:
             # Map import name to pip package name (fall back to import name itself)
@@ -250,8 +353,12 @@ def _check_and_install_deps(imports: list[str]) -> dict:
         return {"installed": [], "note": "all imports already available"}
 
     print(f"[SANDBOX] Installing missing packages: {missing_pip}", flush=True)
+    # The image runs as the non-root `sandbox` user, so installing into the system
+    # site-packages fails with EACCES. --user targets the writable home directory,
+    # which is on sys.path for that user.
     exit_code, output = _exec_in_container(
-        ["pip", "install", "--quiet", "--no-warn-script-location"] + missing_pip
+        ["pip", "install", "--user", "--quiet", "--no-warn-script-location"] + missing_pip,
+        timeout_s=600,
     )
     if exit_code != 0:
         print(f"[SANDBOX WARNING] pip install returned {exit_code}: {output[-400:]}", flush=True)
@@ -355,6 +462,32 @@ async def start_sandbox() -> str:
     try:
         existing = client.containers.get(_CONTAINER_NAME)
         existing.reload()
+
+        # A container left behind by a crashed run is still bound to THAT run's
+        # workspace. Reusing it silently sends every sandbox write into the wrong
+        # run directory, and the resulting files look plausible enough that the
+        # mistake surfaces much later. Verify the mount and rebuild on mismatch.
+        bound = ""
+        for mount in existing.attrs.get("Mounts", []):
+            if mount.get("Destination") == "/workspace":
+                bound = mount.get("Source", "")
+                break
+        if not _same_path(bound, WORKSPACE):
+            print(
+                f"[SANDBOX] Existing container is mounted at '{bound}' but this run "
+                f"needs '{WORKSPACE}'. Removing and recreating.",
+                flush=True,
+            )
+            try:
+                existing.remove(force=True)
+            except Exception as exc:
+                return json.dumps({
+                    "error": f"Could not remove stale container: {exc}",
+                    "error_type": "sandbox_start_error",
+                    "action": f"Run `docker rm -f {_CONTAINER_NAME}` and retry.",
+                })
+            raise docker.errors.NotFound("recreating after workspace mismatch")
+
         if existing.status == "running":
             _container = existing
             print(f"[SANDBOX] Reusing running container '{_CONTAINER_NAME}'.", flush=True)
@@ -382,6 +515,14 @@ async def start_sandbox() -> str:
                 # Keep container alive indefinitely with a no-op tail command.
                 command="tail -f /dev/null",
                 remove=False,
+                # Resource ceilings — this container runs LLM-written code.
+                mem_limit=CONTAINER_MEM_LIMIT,
+                nano_cpus=int(CONTAINER_CPUS * 1_000_000_000),
+                pids_limit=CONTAINER_PIDS_LIMIT,
+                # Network stays ON: _check_and_install_deps pip-installs missing
+                # packages at run time. Isolating the network is tracked for the
+                # M3 codegen gate, which will pre-resolve dependencies so the
+                # container can run with network_disabled=True.
             )
             print(f"[SANDBOX] Container '{_CONTAINER_NAME}' created.", flush=True)
         except Exception as exc:
@@ -396,7 +537,8 @@ async def start_sandbox() -> str:
     # --- 5. Warmup verification ---
     try:
         exit_code, output = _exec_in_container(
-            ["python", "-c", "import sys; print(f'Python {sys.version[:6]} ready')"]
+            ["python", "-c", "import sys; print(f'Python {sys.version[:6]} ready')"],
+            timeout_s=60,
         )
         if exit_code != 0:
             msg = f"Container warmup failed (exit {exit_code}): {output}"
@@ -464,6 +606,21 @@ def _is_shell_command(code: str) -> tuple[bool, str]:
     if len(parts) >= 2 and parts[0] in ("python", "python3") and parts[1].endswith(".py"):
         return True, parts[1]
     return False, ""
+
+
+def _timeout_response(exc: "SandboxTimeout") -> str:
+    """Return a standard error JSON for an execution that blew its time budget."""
+    print(f"[SANDBOX ERROR] {exc}", flush=True)
+    return json.dumps({
+        "success": False,
+        "stdout": "",
+        "stderr": str(exc),
+        "error_type": "timeout",
+        "action": (
+            "The step ran too long and was killed. Sample the data, split the work into "
+            "smaller steps, or reduce the search budget — then run it again."
+        ),
+    })
 
 
 def _exec_error_response(exec_exc: Exception) -> str:
@@ -549,6 +706,8 @@ async def run_in_sandbox(code: str) -> str:
         print(f"[SANDBOX] Running /workspace/{filename}", flush=True)
         try:
             exit_code, output = _exec_in_container(["python", f"/workspace/{filename}"])
+        except SandboxTimeout as timeout_exc:
+            return _timeout_response(timeout_exc)
         except Exception as exec_exc:
             return _exec_error_response(exec_exc)
 
@@ -578,6 +737,8 @@ async def run_in_sandbox(code: str) -> str:
             exit_code, output = _exec_in_container(
                 ["python", f"/workspace/{script_name}"]
             )
+        except SandboxTimeout as timeout_exc:
+            return _timeout_response(timeout_exc)
         except Exception as exec_exc:
             return _exec_error_response(exec_exc)
         finally:

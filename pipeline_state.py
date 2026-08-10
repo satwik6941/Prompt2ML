@@ -167,11 +167,24 @@ def reset_run_id() -> str:
     Call this at the very start of a fresh pipeline run (before saving user_goal)
     so the new run gets its own isolated folders.
     Returns the new run_id.
+
+    The id is a second-resolution timestamp, so two runs started inside the same
+    second would otherwise collide and share a directory — silently, which is the
+    worst way for it to happen. A numeric suffix is appended until the id is both
+    different from the current one and unused on disk.
     """
     import datetime
     global _run_dir_cache
     _run_dir_cache = None
-    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    previous = load_state().get("run_id", "")
+    base = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = base
+    suffix = 1
+    while run_id == previous or (MODIFIED_DATASETS_ROOT / run_id).exists():
+        run_id = f"{base}_{suffix}"
+        suffix += 1
+
     save_state({"run_id": run_id})
     print(f"[PIPELINE] New run started: {run_id}", flush=True)
     return run_id
@@ -184,7 +197,7 @@ def mark_checkpoint(name: str) -> None:
     import datetime
     state = load_state()
     checkpoints = state.get("pipeline_checkpoints", {})
-    checkpoints[name] = datetime.datetime.utcnow().isoformat()
+    checkpoints[name] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     save_state({"pipeline_checkpoints": checkpoints})
     print(f"[PIPELINE] Checkpoint marked: {name}", flush=True)
 
