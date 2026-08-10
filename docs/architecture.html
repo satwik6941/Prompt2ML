@@ -1,0 +1,920 @@
+<title>Prompt2ML — Target Architecture</title>
+<style>
+  :root {
+    --paper:      #F5F6F5;
+    --surface:    #FFFFFF;
+    --surface-2:  #ECEEED;
+    --ink:        #16201F;
+    --ink-soft:   #4A5856;
+    --muted:      #6B7876;
+    --rule:       #D5DAD8;
+    --accent:     #0F6B6B;
+    --accent-dim: #7FA9A7;
+    --warn:       #9A6508;
+    --danger:     #A0392A;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    --measure: 68ch;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper:      #0E1413;
+      --surface:    #151D1C;
+      --surface-2:  #1D2726;
+      --ink:        #DEE5E3;
+      --ink-soft:   #A7B4B2;
+      --muted:      #879795;
+      --rule:       #2C3A38;
+      --accent:     #56B8B0;
+      --accent-dim: #33645F;
+      --warn:       #D9A441;
+      --danger:     #D97A66;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper:      #0E1413;
+    --surface:    #151D1C;
+    --surface-2:  #1D2726;
+    --ink:        #DEE5E3;
+    --ink-soft:   #A7B4B2;
+    --muted:      #879795;
+    --rule:       #2C3A38;
+    --accent:     #56B8B0;
+    --accent-dim: #33645F;
+    --warn:       #D9A441;
+    --danger:     #D97A66;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1040px;
+    margin: 0 auto;
+    padding: 0 28px 96px;
+  }
+  .col { max-width: var(--measure); }
+
+  /* ---- masthead ---- */
+  header.masthead {
+    border-bottom: 1px solid var(--rule);
+    padding: 72px 0 34px;
+    margin-bottom: 56px;
+  }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 20px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: clamp(30px, 4.6vw, 46px);
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    text-wrap: balance;
+    margin: 0 0 20px;
+  }
+  .standfirst {
+    font-size: 18.5px;
+    line-height: 1.55;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 0 0 28px;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 28px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .meta b { color: var(--ink-soft); font-weight: 500; }
+
+  /* ---- sections ---- */
+  section { margin-bottom: 76px; }
+  h2 {
+    font-family: var(--mono);
+    font-size: 21px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    margin: 0 0 6px;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  h2 .num {
+    font-size: 12px;
+    color: var(--accent);
+    letter-spacing: 0.08em;
+  }
+  .lede {
+    color: var(--ink-soft);
+    margin: 0 0 32px;
+    max-width: var(--measure);
+  }
+  h3 {
+    font-family: var(--mono);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin: 40px 0 10px;
+  }
+  p { margin: 0 0 16px; max-width: var(--measure); }
+  strong { font-weight: 600; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.875em;
+    background: var(--surface-2);
+    padding: 0.1em 0.36em;
+    border-radius: 3px;
+  }
+
+  /* ---- figures ---- */
+  figure {
+    margin: 0 0 30px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 26px 24px 20px;
+    overflow-x: auto;
+  }
+  figure svg {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    color: var(--ink-soft);
+  }
+  figcaption {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--muted);
+    margin-top: 20px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+    max-width: 74ch;
+  }
+  figcaption b { color: var(--ink-soft); font-weight: 600; }
+
+  /* svg semantic classes */
+  .s-box   { fill: var(--surface-2); stroke: var(--rule); stroke-width: 1.2; }
+  .s-box-a { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+  .s-line  { stroke: currentColor; stroke-width: 1.3; fill: none; }
+  .s-line-a{ stroke: var(--accent); stroke-width: 1.6; fill: none; }
+  .s-line-d{ stroke: var(--danger); stroke-width: 1.4; fill: none; }
+  .s-dash  { stroke: var(--muted); stroke-width: 1.2; fill: none; stroke-dasharray: 5 4; }
+  .s-t     { fill: var(--ink); font-family: var(--mono); font-size: 12px; }
+  .s-t-sm  { fill: var(--muted); font-family: var(--mono); font-size: 10.5px; }
+  .s-t-a   { fill: var(--accent); font-family: var(--mono); font-size: 10.5px; }
+  .s-t-d   { fill: var(--danger); font-family: var(--mono); font-size: 10.5px; }
+  .s-head  { fill: currentColor; }
+  .s-head-a{ fill: var(--accent); }
+  .s-head-d{ fill: var(--danger); }
+
+  /* ---- decision grid ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(268px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .card { background: var(--surface); padding: 20px 22px 22px; }
+  .card .tag {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 8px;
+  }
+  .card h4 {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    font-weight: 600;
+    margin: 0 0 8px;
+    line-height: 1.35;
+  }
+  .card p { font-size: 14px; margin: 0; color: var(--ink-soft); max-width: none; }
+
+  /* ---- tables ---- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; background: var(--surface); }
+  th, td { text-align: left; padding: 11px 16px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  thead th {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.ms { font-family: var(--mono); font-size: 12.5px; color: var(--accent); white-space: nowrap; }
+  td.dur { font-family: var(--mono); font-size: 12.5px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+  /* ---- run dir tree ---- */
+  pre {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.72;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 22px 24px;
+    overflow-x: auto;
+    margin: 0 0 20px;
+  }
+  pre .c { color: var(--muted); }
+  pre .k { color: var(--accent); }
+
+  /* ---- questions ---- */
+  ol.q { counter-reset: q; list-style: none; padding: 0; margin: 0; max-width: var(--measure); }
+  ol.q li {
+    counter-increment: q;
+    position: relative;
+    padding: 16px 0 16px 44px;
+    border-bottom: 1px solid var(--rule);
+  }
+  ol.q li:last-child { border-bottom: none; }
+  ol.q li::before {
+    content: counter(q, decimal-leading-zero);
+    position: absolute;
+    left: 0; top: 18px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--accent);
+    letter-spacing: 0.06em;
+  }
+  ol.q b { display: block; font-family: var(--mono); font-size: 13.5px; font-weight: 600; margin-bottom: 4px; }
+  ol.q span { color: var(--ink-soft); font-size: 14.5px; }
+  .rec { color: var(--accent); }
+
+  footer {
+    border-top: 1px solid var(--rule);
+    padding-top: 26px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  @media (max-width: 640px) {
+    .wrap { padding: 0 18px 64px; }
+    header.masthead { padding-top: 48px; }
+  }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">Prompt2ML · Target Architecture</p>
+  <h1>From one prompt to a trained model — end to end</h1>
+  <p class="standfirst">
+    A Windows-first CLI that takes a plain-English project idea and returns a trained model,
+    its evaluation plots, the exact dataset behind it, and the reports explaining every
+    decision. Tabular, text, and vision. Local by default, rented GPU when the work needs it.
+  </p>
+  <div class="meta">
+    <span><b>repo</b> satwik6941/Prompt2ML</span>
+    <span><b>branch</b> claude/codebase-analysis-ml-dl-fkdd9v</span>
+    <span><b>plan</b> docs/IMPLEMENTATION_PLAN.md</span>
+    <span><b>status</b> awaiting approval</span>
+  </div>
+</header>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">01</span> The seven decisions</h2>
+  <p class="lede">
+    Everything downstream is a consequence of these. They exist because the current system
+    is a single tabular-CSV path with a global state blob, and neither survives contact with
+    computer vision or a rented GPU.
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <span class="tag">D1</span>
+      <h4>Modality routes the pipeline</h4>
+      <p>Extraction declares tabular / text / vision / audio / timeseries. Each gets its own preprocessing tools and trainer recipe, sharing one contract on both ends.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D2</span>
+      <h4>Typed per-run contract</h4>
+      <p>A <code>runs/&lt;id&gt;/</code> directory of small validated documents replaces <code>pipeline_state.json</code> — killing the overloaded status key and enabling concurrent runs.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D3</span>
+      <h4>Research is a tool, not a phase</h4>
+      <p>An <code>AgentTool</code> any agent can call mid-task, disk-cached. The pre-phase researcher couldn't answer questions that only arise later.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D4</span>
+      <h4>Generated code passes a gate</h4>
+      <p>Doc grounding, then ruff and AST checks, then a sampled smoke run — before any full training run is paid for.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D5</span>
+      <h4>Leakage enforced by a linter</h4>
+      <p>Instructions already failed at this: imputation still fits on the full dataset today. An AST pass asserts fit-after-split instead of asking for it.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D6</span>
+      <h4>Hardware profile is a budget</h4>
+      <p>A scan that only informs the prompt gets ignored. The derived budget is enforced — the gate rejects scripts that exceed VRAM, batch, or time.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D7</span>
+      <h4>Execution is a swappable backend</h4>
+      <p>Local Docker, local venv, JarvisLabs, RunPod, Colab behind one interface. A deterministic broker picks — never the LLM.</p>
+    </div>
+    <div class="card">
+      <span class="tag">D7a</span>
+      <h4>Money and data have guardrails</h4>
+      <p>Every remote instance runs on a lease with a TTL supervisor that terminates regardless of agent state. Data egress is per-run opt-in.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">02</span> The full run, start to end</h2>
+  <p class="lede">
+    Seven stages. Each writes one typed document, and the next stage reads only that — so a
+    crash resumes from disk and a phase can be re-run in isolation.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 704" role="img" aria-label="Vertical pipeline of seven stages from user idea to artifact bundle, with the typed document each stage writes labelled on the connecting arrows, and retry loops marked on the preprocessing and training stages.">
+      <defs>
+        <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+        <marker id="a1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head-a"/>
+        </marker>
+      </defs>
+
+      <!-- stage 1 -->
+      <rect x="196" y="14" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="37" class="s-t">1 · Interview</text>
+      <text x="212" y="55" class="s-t-sm">slot-gated · calls research mid-conversation</text>
+      <line x1="361" y1="68" x2="361" y2="106" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="92" class="s-t-a">requirements.json</text>
+
+      <!-- stage 2 -->
+      <rect x="196" y="110" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="133" class="s-t">2 · Extract + detect modality</text>
+      <text x="212" y="151" class="s-t-sm">Kaggle · HuggingFace · local → normalize</text>
+      <line x1="361" y1="164" x2="361" y2="202" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="188" class="s-t-a">dataset_manifest.json</text>
+
+      <!-- stage 3 -->
+      <rect x="196" y="206" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="229" class="s-t">3 · Preprocess</text>
+      <text x="212" y="247" class="s-t-sm">routed by modality · execute ↔ validate</text>
+      <path d="M196,222 L172,222 L172,252 L196,252" class="s-line" marker-end="url(#a1)"/>
+      <text x="18" y="240" class="s-t-sm">retry ×5</text>
+      <line x1="361" y1="260" x2="361" y2="298" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="284" class="s-t-a">data_contract.json + dataset</text>
+
+      <!-- stage 4 -->
+      <rect x="196" y="302" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="325" class="s-t">4 · Plan training</text>
+      <text x="212" y="343" class="s-t-sm">reads hardware budget · calls research</text>
+      <line x1="361" y1="356" x2="361" y2="394" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="380" class="s-t-a">plan.json</text>
+
+      <!-- stage 5 -->
+      <rect x="196" y="398" width="330" height="54" rx="4" class="s-box-a"/>
+      <text x="212" y="421" class="s-t">5 · Select compute</text>
+      <text x="212" y="439" class="s-t-sm">broker ranks backends · opens a lease</text>
+      <line x1="361" y1="452" x2="361" y2="490" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="476" class="s-t-a">leases.json</text>
+
+      <!-- stage 6 -->
+      <rect x="196" y="494" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="517" class="s-t">6 · Train</text>
+      <text x="212" y="535" class="s-t-sm">gated codegen · train ↔ audit for leakage</text>
+      <path d="M196,510 L172,510 L172,540 L196,540" class="s-line" marker-end="url(#a1)"/>
+      <text x="18" y="528" class="s-t-sm">retry ×3</text>
+      <line x1="361" y1="548" x2="361" y2="586" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="572" class="s-t-a">model · metrics · plots</text>
+
+      <!-- stage 7 -->
+      <rect x="196" y="590" width="330" height="54" rx="4" class="s-box"/>
+      <text x="212" y="613" class="s-t">7 · Bundle + verify</text>
+      <text x="212" y="631" class="s-t-sm">fails the run if any artifact is missing</text>
+      <line x1="361" y1="644" x2="361" y2="676" class="s-line-a" marker-end="url(#a1a)"/>
+      <text x="374" y="666" class="s-t-a">reports/ · inference.py</text>
+
+      <text x="196" y="694" class="s-t-sm">every document is Pydantic-validated and written atomically</text>
+    </svg>
+    <figcaption>
+      <b>The contract is the interface.</b> No stage reaches into another's memory — the labelled
+      arrow is the entire handoff. That is what makes <code>prompt2ml resume</code> possible and
+      what removes the list-or-dict ambiguity the current <code>_latest()</code> helper works around.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">03</span> Modality routing</h2>
+  <p class="lede">
+    Today <code>datasets/</code> is scanned for CSVs and everything downstream assumes a
+    DataFrame — which is why the NLP path is broken end to end: HuggingFace datasets are
+    saved as Arrow shards that the scanner cannot read.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 296" role="img" aria-label="One dataset manifest fans out into four modality-specific preprocessing pipelines, which all converge back onto a single data contract consumed by two trainer recipes.">
+      <defs>
+        <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+      </defs>
+
+      <rect x="8" y="118" width="124" height="52" rx="4" class="s-box-a"/>
+      <text x="22" y="140" class="s-t">manifest</text>
+      <text x="22" y="157" class="s-t-sm">modality declared</text>
+
+      <line x1="132" y1="144" x2="176" y2="144" class="s-line" marker-end="url(#a2)"/>
+
+      <!-- fan out -->
+      <path d="M176,144 L200,144 L200,32" class="s-line"/>
+      <path d="M200,144 L200,104" class="s-line"/>
+      <path d="M200,144 L200,184" class="s-line"/>
+      <path d="M200,144 L200,256" class="s-line"/>
+
+      <line x1="200" y1="32"  x2="238" y2="32"  class="s-line" marker-end="url(#a2)"/>
+      <line x1="200" y1="104" x2="238" y2="104" class="s-line" marker-end="url(#a2)"/>
+      <line x1="200" y1="184" x2="238" y2="184" class="s-line" marker-end="url(#a2)"/>
+      <line x1="200" y1="256" x2="238" y2="256" class="s-line" marker-end="url(#a2)"/>
+
+      <rect x="242" y="10" width="196" height="44" rx="4" class="s-box"/>
+      <text x="256" y="30" class="s-t">tabular</text>
+      <text x="256" y="45" class="s-t-sm">impute · encode · engineer</text>
+
+      <rect x="242" y="82" width="196" height="44" rx="4" class="s-box"/>
+      <text x="256" y="102" class="s-t">text</text>
+      <text x="256" y="117" class="s-t-sm">dedup · balance · tokenizer</text>
+
+      <rect x="242" y="162" width="196" height="44" rx="4" class="s-box"/>
+      <text x="256" y="182" class="s-t">vision</text>
+      <text x="256" y="197" class="s-t-sm">scan · phash dedup · transforms</text>
+
+      <rect x="242" y="234" width="196" height="44" rx="4" class="s-box"/>
+      <text x="256" y="254" class="s-t">timeseries</text>
+      <text x="256" y="269" class="s-t-sm">chronological split enforced</text>
+
+      <!-- converge -->
+      <line x1="438" y1="32"  x2="476" y2="32"  class="s-line"/>
+      <line x1="438" y1="104" x2="476" y2="104" class="s-line"/>
+      <line x1="438" y1="184" x2="476" y2="184" class="s-line"/>
+      <line x1="438" y1="256" x2="476" y2="256" class="s-line"/>
+      <path d="M476,32 L476,256" class="s-line"/>
+      <line x1="476" y1="144" x2="516" y2="144" class="s-line" marker-end="url(#a2)"/>
+
+      <rect x="520" y="118" width="128" height="52" rx="4" class="s-box-a"/>
+      <text x="534" y="140" class="s-t">data_contract</text>
+      <text x="534" y="157" class="s-t-sm">features · target · splits</text>
+
+      <line x1="648" y1="144" x2="684" y2="144" class="s-line" marker-end="url(#a2)"/>
+      <text x="560" y="196" class="s-t-sm">→ train_sklearn</text>
+      <text x="560" y="212" class="s-t-sm">→ train_torch</text>
+    </svg>
+    <figcaption>
+      <b>Divergent middle, common ends.</b> The manifest and the contract are modality-agnostic,
+      so the trainer, the audit loop, and the reporter never branch. Only the preprocessing
+      tools differ — which is exactly the seam that lets vision be added without touching
+      anything that already works.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">04</span> Making generated code trustworthy</h2>
+  <p class="lede">
+    Your ask was that agent-written code behave like a careful human's — reading current docs,
+    following best practice, checking when unsure. That becomes four mechanical steps, because
+    prompt instructions demonstrably do not hold.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 250" role="img" aria-label="Generated code flows through doc grounding, generation, a static gate, a smoke run on sampled data, and finally the full run; the static gate and smoke run both send failures back to generation with diagnostics.">
+      <defs>
+        <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+        <marker id="a3d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head-d"/>
+        </marker>
+      </defs>
+
+      <rect x="4" y="76" width="118" height="56" rx="4" class="s-box"/>
+      <text x="16" y="98" class="s-t">grounding</text>
+      <text x="16" y="114" class="s-t-sm">pinned versions</text>
+      <text x="16" y="127" class="s-t-sm">+ fetched docs</text>
+
+      <line x1="122" y1="104" x2="152" y2="104" class="s-line" marker-end="url(#a3)"/>
+
+      <rect x="156" y="76" width="112" height="56" rx="4" class="s-box"/>
+      <text x="168" y="98" class="s-t">generate</text>
+      <text x="168" y="114" class="s-t-sm">script written</text>
+
+      <line x1="268" y1="104" x2="298" y2="104" class="s-line" marker-end="url(#a3)"/>
+
+      <rect x="302" y="66" width="136" height="76" rx="4" class="s-box-a"/>
+      <text x="314" y="88" class="s-t">static gate</text>
+      <text x="314" y="105" class="s-t-sm">ast · ruff</text>
+      <text x="314" y="119" class="s-t-sm">leakage lint</text>
+      <text x="314" y="133" class="s-t-sm">budget check</text>
+
+      <line x1="438" y1="104" x2="468" y2="104" class="s-line" marker-end="url(#a3)"/>
+
+      <rect x="472" y="76" width="118" height="56" rx="4" class="s-box"/>
+      <text x="484" y="98" class="s-t">smoke run</text>
+      <text x="484" y="114" class="s-t-sm">200 rows</text>
+      <text x="484" y="127" class="s-t-sm">1 epoch</text>
+
+      <line x1="590" y1="104" x2="620" y2="104" class="s-line" marker-end="url(#a3)"/>
+
+      <rect x="624" y="76" width="92" height="56" rx="4" class="s-box"/>
+      <text x="636" y="98" class="s-t">full run</text>
+      <text x="636" y="114" class="s-t-sm">on backend</text>
+
+      <!-- reject loops -->
+      <path d="M370,142 L370,186 L212,186 L212,136" class="s-line-d" marker-end="url(#a3d)"/>
+      <text x="238" y="200" class="s-t-d">rejected · structured diagnostics</text>
+
+      <path d="M531,132 L531,222 L206,222 L206,136" class="s-line-d" marker-end="url(#a3d)"/>
+      <text x="238" y="236" class="s-t-d">crashed on 1% of the data, not 100%</text>
+
+      <text x="4" y="36" class="s-t-sm">nothing reaches a paid GPU until it has already run once on sampled data</text>
+      <line x1="4" y1="48" x2="716" y2="48" class="s-dash"/>
+    </svg>
+    <figcaption>
+      <b>The back-edges are the point.</b> Both rejection paths return to generation with
+      diagnostics rather than surfacing to the user — and both happen before any full training
+      run. On rented hardware the smoke step is also the difference between a five-cent failure
+      and a fifteen-dollar one.
+    </figcaption>
+  </figure>
+
+  <h3>Why leakage needs a linter, not an instruction</h3>
+  <p>
+    The current system correctly defers scaling and target encoding out of preprocessing —
+    but imputation, frequency encoding, and outlier bounds are still fit on the full dataset,
+    and the existing validator cannot detect that. Every metric it reports is optimistic by
+    an unknown margin.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 210" role="img" aria-label="Left panel shows the current flow where an imputer is fitted on the full dataset before the train-test split, leaking test statistics into training. Right panel shows the corrected flow where the split happens first and the imputer is fitted inside a pipeline on training folds only.">
+      <defs>
+        <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+      </defs>
+
+      <text x="4" y="16" class="s-t-d">TODAY — statistics cross the split</text>
+      <rect x="4" y="30" width="96" height="40" rx="4" class="s-box"/>
+      <text x="16" y="55" class="s-t">full data</text>
+      <line x1="100" y1="50" x2="126" y2="50" class="s-line" marker-end="url(#a4)"/>
+      <rect x="130" y="30" width="112" height="40" rx="4" class="s-box"/>
+      <text x="142" y="49" class="s-t">fit imputer</text>
+      <text x="142" y="63" class="s-t-d">sees test rows</text>
+      <line x1="242" y1="50" x2="268" y2="50" class="s-line" marker-end="url(#a4)"/>
+      <rect x="272" y="30" width="70" height="40" rx="4" class="s-box"/>
+      <text x="284" y="55" class="s-t">split</text>
+      <path d="M186,70 L186,96 L310,96 L310,74" class="s-line-d" marker-end="url(#a4)"/>
+      <text x="150" y="116" class="s-t-d">test statistics already inside the features</text>
+
+      <line x1="356" y1="24" x2="356" y2="132" class="s-dash"/>
+
+      <text x="378" y="16" class="s-t-a">AFTER — split first, fit inside the pipeline</text>
+      <rect x="378" y="30" width="88" height="40" rx="4" class="s-box"/>
+      <text x="390" y="55" class="s-t">full data</text>
+      <line x1="466" y1="50" x2="492" y2="50" class="s-line" marker-end="url(#a4)"/>
+      <rect x="496" y="30" width="62" height="40" rx="4" class="s-box-a"/>
+      <text x="508" y="55" class="s-t">split</text>
+      <line x1="558" y1="50" x2="584" y2="50" class="s-line" marker-end="url(#a4)"/>
+      <rect x="588" y="30" width="128" height="40" rx="4" class="s-box"/>
+      <text x="600" y="49" class="s-t">Pipeline(fit)</text>
+      <text x="600" y="63" class="s-t-a">train folds only</text>
+      <text x="378" y="96" class="s-t-sm">imputer · encoder · scaler all move inside</text>
+      <text x="378" y="116" class="s-t-a">leakage_lint fails the build if anything fits earlier</text>
+
+      <line x1="4" y1="146" x2="716" y2="146" class="s-dash"/>
+      <text x="4" y="168" class="s-t-sm">AST assertions: no .fit() before the split call · every transformer inside a Pipeline or ColumnTransformer</text>
+      <text x="4" y="186" class="s-t-sm">CV receives the pipeline, never a bare estimator · random_state present · time series never shuffled</text>
+    </svg>
+    <figcaption>
+      <b>Draw the one edge that changes.</b> The fix is not new code so much as a moved boundary —
+      and a check that fails loudly when the boundary moves back. This is the single most
+      important correctness change in the plan, which is why it lands in M0 before anything
+      is built on top.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">05</span> Compute: local first, rented when it earns it</h2>
+  <p class="lede">
+    You want data and processing local. Rented GPUs contradict that for whatever gets
+    uploaded — so remote is a deliberate, per-run choice with the boundary drawn explicitly,
+    never a silent fallback.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 340" role="img" aria-label="The planner declares a resource need to a deterministic broker, which ranks five execution backends. A dashed boundary separates the two local backends that keep data on the machine from the three remote backends that require data to leave it.">
+      <defs>
+        <marker id="a5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+        <marker id="a5a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head-a"/>
+        </marker>
+      </defs>
+
+      <rect x="4" y="128" width="150" height="62" rx="4" class="s-box"/>
+      <text x="18" y="150" class="s-t">planner</text>
+      <text x="18" y="167" class="s-t-sm">declares need:</text>
+      <text x="18" y="181" class="s-t-sm">vram · minutes · net</text>
+
+      <line x1="154" y1="159" x2="192" y2="159" class="s-line" marker-end="url(#a5)"/>
+
+      <rect x="196" y="122" width="150" height="74" rx="4" class="s-box-a"/>
+      <text x="210" y="144" class="s-t">ComputeBroker</text>
+      <text x="210" y="161" class="s-t-sm">deterministic ranking</text>
+      <text x="210" y="175" class="s-t-sm">cost ceiling · consent</text>
+      <text x="210" y="189" class="s-t-a">unit-testable, not an LLM call</text>
+
+      <!-- boundary -->
+      <line x1="404" y1="8" x2="404" y2="332" class="s-dash"/>
+      <text x="414" y="22" class="s-t-sm">data stays on your PC ↑ · leaves it ↓</text>
+
+      <!-- local backends -->
+      <path d="M346,159 L370,159 L370,60 L438,60" class="s-line" marker-end="url(#a5)"/>
+      <rect x="442" y="38" width="274" height="44" rx="4" class="s-box"/>
+      <text x="456" y="58" class="s-t">LocalDocker</text>
+      <text x="456" y="73" class="s-t-sm">container isolation · --gpus all when probed OK</text>
+
+      <path d="M370,159 L370,120 L438,120" class="s-line" marker-end="url(#a5)"/>
+      <rect x="442" y="98" width="274" height="44" rx="4" class="s-box"/>
+      <text x="456" y="118" class="s-t">LocalVenv</text>
+      <text x="456" y="133" class="s-t-sm">native CUDA · no isolation · consented fallback</text>
+
+      <!-- remote backends -->
+      <path d="M370,159 L370,208 L438,208" class="s-line-a" marker-end="url(#a5a)"/>
+      <rect x="442" y="186" width="274" height="44" rx="4" class="s-box"/>
+      <text x="456" y="206" class="s-t">JarvisLabs</text>
+      <text x="456" y="221" class="s-t-sm">jl create → jl run → logs → download → destroy</text>
+
+      <path d="M370,208 L370,262 L438,262" class="s-line-a" marker-end="url(#a5a)"/>
+      <rect x="442" y="240" width="274" height="44" rx="4" class="s-box"/>
+      <text x="456" y="260" class="s-t">RunPod</text>
+      <text x="456" y="275" class="s-t-sm">runs our own image → exact version parity</text>
+
+      <path d="M370,262 L370,312 L438,312" class="s-line-a" marker-end="url(#a5a)"/>
+      <rect x="442" y="294" width="274" height="38" rx="4" class="s-box"/>
+      <text x="456" y="312" class="s-t">Colab</text>
+      <text x="456" y="326" class="s-t-sm">last resort · never auto-selected</text>
+
+      <text x="4" y="230" class="s-t-sm">--local-only</text>
+      <text x="4" y="246" class="s-t-sm">hard-fails rather</text>
+      <text x="4" y="262" class="s-t-sm">than crossing</text>
+      <text x="4" y="278" class="s-t-sm">the line</text>
+    </svg>
+    <figcaption>
+      <b>The dashed line is the decision.</b> Every backend implements the same
+      <code>prepare / put / run / get / teardown</code> interface, so the codegen gate and the
+      audit loop are identical whether the job runs in a local container or on an H100. What
+      differs is only what crosses that boundary — and that requires your explicit consent
+      each run.
+    </figcaption>
+  </figure>
+
+  <h3>Why a lease, and not a stop button</h3>
+  <p>
+    The existing <code>stop_colab_runtime()</code> can only write a script <em>asking</em> the
+    model to release the GPU. Rented instances bill by the minute, so teardown cannot be an
+    agent decision.
+  </p>
+
+  <figure>
+    <svg viewBox="0 0 720 232" role="img" aria-label="A lease is recorded to disk before the instance is created, then a supervisor thread, signal handlers, and normal completion all converge on termination; startup reconciliation catches any instance that survived a crash.">
+      <defs>
+        <marker id="a6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head"/>
+        </marker>
+        <marker id="a6a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" class="s-head-a"/>
+        </marker>
+      </defs>
+
+      <rect x="4" y="72" width="132" height="48" rx="4" class="s-box-a"/>
+      <text x="16" y="92" class="s-t">record lease</text>
+      <text x="16" y="107" class="s-t-a">before create</text>
+
+      <line x1="136" y1="96" x2="170" y2="96" class="s-line" marker-end="url(#a6)"/>
+
+      <rect x="174" y="72" width="118" height="48" rx="4" class="s-box"/>
+      <text x="186" y="92" class="s-t">instance up</text>
+      <text x="186" y="107" class="s-t-sm">billing starts</text>
+
+      <line x1="292" y1="96" x2="326" y2="96" class="s-line" marker-end="url(#a6)"/>
+
+      <rect x="330" y="72" width="118" height="48" rx="4" class="s-box"/>
+      <text x="342" y="92" class="s-t">training</text>
+      <text x="342" y="107" class="s-t-sm">logs polled</text>
+
+      <!-- three triggers -->
+      <path d="M389,72 L389,36 L556,36 L556,68" class="s-line" marker-end="url(#a6)"/>
+      <text x="404" y="28" class="s-t-sm">TTL expiry — supervisor thread</text>
+
+      <line x1="448" y1="96" x2="552" y2="96" class="s-line" marker-end="url(#a6)"/>
+      <text x="462" y="90" class="s-t-sm">run ends</text>
+
+      <path d="M389,120 L389,156 L556,156 L556,124" class="s-line" marker-end="url(#a6)"/>
+      <text x="404" y="172" class="s-t-sm">SIGINT / SIGTERM / atexit</text>
+
+      <rect x="556" y="68" width="160" height="56" rx="4" class="s-box-a"/>
+      <text x="570" y="90" class="s-t">terminated</text>
+      <text x="570" y="106" class="s-t-sm">PAUSE or DESTROY</text>
+      <text x="570" y="119" class="s-t-sm">lease record closed</text>
+
+      <line x1="4" y1="192" x2="716" y2="192" class="s-dash"/>
+      <text x="4" y="214" class="s-t-sm">next startup + prompt2ml doctor reconcile the lease file against the provider's live instance list → orphans offered for cleanup</text>
+    </svg>
+    <figcaption>
+      <b>Recorded before created.</b> That ordering is what makes a crash between the two calls
+      recoverable — the record exists even when the instance creation is the thing that killed
+      the process. Three independent paths reach termination, and none of them require the
+      agent to be alive or cooperative.
+    </figcaption>
+  </figure>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">06</span> What a run leaves on disk</h2>
+  <p class="lede">
+    Your definition of done, made checkable. <code>verify_bundle()</code> fails the run when
+    anything here is missing, so "complete" is asserted rather than hoped for.
+  </p>
+
+<pre><span class="c">runs/20260810_142233/</span>
+  <span class="k">run.json</span>                 <span class="c">phases, timings, checkpoints</span>
+  <span class="k">requirements.json</span>        <span class="c">structured slots from the interview</span>
+  <span class="k">dataset_manifest.json</span>    <span class="c">modality, files, splits, label location</span>
+  <span class="k">data_contract.json</span>       <span class="c">features, target, deferred transforms</span>
+  <span class="k">plan.json</span>                <span class="c">models, metrics, search budget</span>
+  <span class="k">hardware.json</span>            <span class="c">profile + enforced training budget</span>
+  <span class="k">leases.json</span>              <span class="c">remote instances, TTL, accrued cost</span>
+  <span class="k">logs/</span>                    <span class="c">agent transcripts, every generated script</span>
+  <span class="k">artifacts/</span>
+    <span class="k">model/</span>                 <span class="c">best_model.pt · inference.py · input schema</span>
+    <span class="k">data/</span>                  <span class="c">the exact dataset used for training</span>
+    <span class="k">plots/</span>                 <span class="c">curves · confusion · ROC · importance</span>
+    <span class="k">reports/</span>               <span class="c">requirements · preprocessing · training · final</span>
+    <span class="k">RUN_SUMMARY.md</span>         <span class="c">where every step physically ran</span></pre>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">07</span> Build order</h2>
+  <p class="lede">
+    Sequenced by dependency. M0 first because deep learning on top of untrustworthy metrics
+    multiplies the debugging surface without adding anything.
+  </p>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th>Milestone</th><th>Scope</th><th>Done when</th><th>Est.</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="ms">M0</td>
+          <td>Correctness &amp; hygiene — leakage, reproducibility, sandbox hardening, first tests</td>
+          <td>Two runs on the same CSV are byte-identical; every fixed bug has a test</td>
+          <td class="dur">1 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M1</td>
+          <td>Package, run contract, CLI, <code>doctor</code></td>
+          <td><code>pip install -e .</code> → accurate readiness table on a clean Windows box</td>
+          <td class="dur">2 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M2</td>
+          <td>Research as a tool + slot-gated adaptive interview</td>
+          <td>Two different ideas produce visibly different question sequences</td>
+          <td class="dur">1 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M3</td>
+          <td>Codegen quality gate</td>
+          <td>A deliberately leaky script is rejected before execution</td>
+          <td class="dur">1.5 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M4</td>
+          <td>Text/NLP pipeline — fixes the broken HuggingFace path</td>
+          <td>"Classify support tickets by urgency" trains unattended</td>
+          <td class="dur">2 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M5</td>
+          <td>Compute backends — local GPU, JarvisLabs, RunPod, leases</td>
+          <td>Same job runs unmodified on all three; SIGINT kills the remote instance</td>
+          <td class="dur">2 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M6</td>
+          <td>Vision pipeline + deep-learning trainer</td>
+          <td>Image classification end to end; degrades gracefully to CPU</td>
+          <td class="dur">2.5 wk</td>
+        </tr>
+        <tr>
+          <td class="ms">M7</td>
+          <td>Deliverable bundle &amp; polish</td>
+          <td><code>verify_bundle()</code> green on every supported modality</td>
+          <td class="dur">1 wk</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p style="margin-top:24px">
+    M5 sits before M6 deliberately: vision is what actually needs the GPU, and debugging a new
+    pipeline and a new execution backend at the same time means never knowing which one broke.
+    The backends land against the already-working text trainer first.
+  </p>
+</section>
+
+<!-- ============================================ -->
+<section>
+  <h2><span class="num">08</span> Open before I start</h2>
+  <p class="lede">
+    Six calls that change what gets built. My recommendation is marked on each — say
+    "go" and I'll take these as answered.
+  </p>
+
+  <ol class="q">
+    <li>
+      <b>Cost ceiling default</b>
+      <span>Should <code>--max-cost-usd</code> default to something non-zero so an unattended
+      run can never surprise you? <span class="rec">Recommend $5 default, override to raise.</span></span>
+    </li>
+    <li>
+      <b>Disposition when a run finishes</b>
+      <span>PAUSE keeps the instance warm but storage still bills; DESTROY costs nothing and
+      restarts cold. <span class="rec">Recommend DESTROY by default, <code>--keep-warm</code> to opt in.</span></span>
+    </li>
+    <li>
+      <b>Colab's future</b>
+      <span>JarvisLabs and RunPod are strictly better behaved — real APIs, real teardown.
+      <span class="rec">Recommend demoting Colab to "supported if configured, never auto-selected".</span></span>
+    </li>
+    <li>
+      <b>Host-venv consent</b>
+      <span>It's the only path that drops isolation entirely.
+      <span class="rec">Recommend per-run confirmation rather than a global opt-in at setup.</span></span>
+    </li>
+    <li>
+      <b>Vision dataset ceiling</b>
+      <span>Cap by rows, gigabytes, or wall-clock — and is subsampling automatic or does it
+      prompt you? <span class="rec">Recommend GB cap with a prompt, since transfer cost dominates.</span></span>
+    </li>
+    <li>
+      <b>Model registry</b>
+      <span>Do repeated runs on the same dataset accumulate a comparable history, or is each
+      run standalone? <span class="rec">Recommend standalone for now — revisit after M7.</span></span>
+    </li>
+  </ol>
+</section>
+
+<footer>
+  Full detail in <b>docs/IMPLEMENTATION_PLAN.md</b> · JarvisLabs and RunPod API surfaces
+  verified against current documentation, not recalled.
+</footer>
+
+</div>

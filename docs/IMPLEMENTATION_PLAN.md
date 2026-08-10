@@ -119,13 +119,111 @@ model size, epoch count). That turns "select the GPU" into a constraint the syst
 silently violate.
 
 **Windows GPU reality:** GPU-in-Docker on Windows needs the WSL2 backend + NVIDIA Container
-Toolkit. `doctor` probes it explicitly by running a throwaway `--gpus all` container. Three
-outcomes, in preference order:
+Toolkit. `doctor` probes it explicitly by running a throwaway `--gpus all` container. If it
+fails but a GPU is present, **host venv** training is offered with explicit consent (fast,
+not isolated — the tradeoff is stated plainly, never assumed). If there's no usable local
+GPU at all, the run falls through to the remote tier described in D7.
 
-1. passthrough works → train in the sandbox with GPU (isolated + fast)
-2. passthrough unavailable, GPU present → offer **host venv** training with explicit
-   one-time consent (fast, not isolated — the tradeoff is stated plainly, never assumed)
-3. no usable GPU → Colab bridge, or CPU with a reduced budget
+### D7 — Execution is a swappable backend, and remote GPU is a first-class tier
+
+The current sandbox contract is "a host directory volume-mounted as `/workspace` in a local
+container." Remote GPU breaks that assumption — the workspace is no longer local — so
+execution has to move behind an interface:
+
+```python
+class ExecutionBackend(Protocol):
+    def capabilities(self) -> Capabilities   # gpu, vram_gb, $/hr, isolation, egress
+    def prepare(self, workspace: Path) -> Handle
+    def put(self, files: list[Path]) -> None
+    def run(self, cmd: str, timeout_s: int) -> ExecResult
+    def get(self, remote_paths: list[str], dest: Path) -> None
+    def teardown(self, disposition: Disposition) -> None   # PAUSE | DESTROY
+```
+
+Five implementations:
+
+| Backend | Mechanism | Isolation | Data leaves PC | Notes |
+|---|---|---|---|---|
+| `LocalDocker` | existing volume mount | container | no | default; GPU via `--gpus all` when probed OK |
+| `LocalVenv` | host Python + native CUDA | **none** | no | consented fallback when passthrough fails |
+| `JarvisLabs` | `jl` CLI | instance | **yes** | managed-job model fits our flow closely |
+| `RunPod` | `runpod` Python SDK | pod | **yes** | runs *our* image → best version parity |
+| `Colab` | existing bridge | notebook | **yes** | last resort; currently half-wired |
+
+Everything upstream is unchanged: the codegen gate, leakage lint, and smoke run all operate
+on the script *before* it reaches a backend, so they apply identically whether the job runs
+in a local container or on an H100.
+
+**Provider notes (APIs verified, not assumed):**
+
+*JarvisLabs* exposes a managed-job abstraction that maps almost 1:1 onto our needs:
+`jl create --gpu <type> --storage <gb> --yes --json` → `jl run . --script train.py --on <id>
+--requirements requirements.txt --json --yes` → poll `jl run logs <run_id> --tail 50` →
+`jl download <id> /home/results ./results -r` → `jl pause|destroy <id> --yes --json`.
+Three constraints shape the adapter: always pass `--json` (otherwise the CLI blocks
+streaming logs), never `--follow`, and `machine_id` **can change after `resume`** — so the
+lease record stores whatever ID the last call returned, never a cached one.
+
+*RunPod* is lower-level and therefore the better parity story: `runpod.create_pod(name,
+image_name, gpu_type_id, ..., network_volume_id=...)` launches **our own published sandbox
+image**, so the pinned versions the codegen grounding promises are the versions that
+actually run. Lifecycle is `stop_pod` (keeps the volume, stops compute billing) vs
+`terminate_pod` (deletes everything) — mapped onto the shared `Disposition` enum along with
+JarvisLabs' pause/destroy.
+
+**Image parity is a correctness requirement, not an optimization.** D4 grounds generated
+code against pinned versions from `docker/requirements.txt`. If a remote box runs different
+versions, that grounding is a lie. So the sandbox image gets published in two variants —
+`prompt2ml-sandbox:cpu` and `prompt2ml-sandbox:cuda12` — and remote backends launch the
+same image. Where a provider imposes its own template (JarvisLabs), the adapter reconciles
+via `--requirements` and **verifies** the resulting versions on the instance before training
+starts, failing loudly on mismatch.
+
+**The broker picks the backend, not the LLM.** `ComputeBroker.select()` is deterministic and
+unit-testable. The planner only declares a *need* (`vram_gb`, `est_minutes`,
+`needs_network`); the broker ranks feasible backends by policy:
+
+```
+local GPU (fits budget)  →  local CPU (if est_minutes under threshold)
+                         →  remote GPU (cheapest feasible within cost ceiling)
+                         →  fail with a clear explanation
+```
+
+Overridable with `--backend`, `--max-cost-usd`, `--local-only`.
+
+**Transfer strategy.** Never ship raw datasets by default. The broker's provisioning plan
+chooses between *upload* (preprocessed bundle, compressed) and *remote-fetch* (the instance
+pulls from Kaggle/HF directly using forwarded credentials, so only scripts and the data
+contract cross the wire). For large vision sets remote-fetch is dramatically cheaper and
+faster.
+
+### D7a — Money and data safety (non-negotiable guardrails)
+
+Remote GPU introduces two failure modes the current codebase has no defense against. Both
+get harness-level enforcement, never agent discretion.
+
+**Runaway cost.** Today's `stop_colab_runtime()` can only *write a script asking* the model
+to release the GPU — the exact anti-pattern to avoid. Instead:
+
+- Every remote instance is created through a **lease**: `{provider, instance_id, created_at,
+  ttl_s, max_cost_usd, disposition_on_expiry}` persisted to `runs/<id>/leases.json` **before**
+  the instance exists (so a crash between create and record can't orphan it).
+- A supervisor thread enforces the TTL and terminates on expiry **regardless of agent state**.
+- `atexit` + `SIGINT`/`SIGTERM` handlers tear down on any exit path.
+- `prompt2ml doctor` and every startup reconcile persisted leases against the provider's live
+  instance list and offer to kill orphans. `prompt2ml clean --leases` forces it.
+- Cost is estimated before launch ($/hr × budget minutes) and shown for confirmation; runs
+  exceeding `--max-cost-usd` are refused, not truncated mid-training.
+
+**Data egress.** You said you want data and compute local — cloud GPU directly contradicts
+that for whatever dataset gets uploaded. So it is never implicit:
+
+- Remote backends require per-run opt-in (`--allow-remote`, or an interactive confirmation
+  naming the provider and the exact bytes to be transferred).
+- `--local-only` hard-fails rather than silently falling back to a remote tier.
+- Credentials forwarded for remote-fetch are scoped and short-lived where the provider
+  supports it, and never written into generated scripts or logs.
+- The final report records where every training step physically ran.
 
 ---
 
@@ -148,7 +246,11 @@ src/prompt2ml/
     text/         ...
     vision/       ...
   codegen/        grounding.py, lint.py, smoke.py, repair.py
-  sandbox/        docker.py, gpu.py, limits.py
+  compute/
+    broker.py     # deterministic backend selection
+    leases.py     # lease record, TTL supervisor, orphan reconciliation
+    backends/     local_docker.py, local_venv.py, jarvislabs.py, runpod.py, colab.py
+  sandbox/        docker.py, gpu.py, limits.py, images.py
   reporting/      bundle.py, plots.py, templates/
   agents/         (ADK agent definitions, thin — logic lives in the modules above)
 ```
@@ -157,13 +259,13 @@ Commands:
 
 | Command | Behaviour |
 |---|---|
-| `prompt2ml init` | One-time setup wizard: Kaggle / HF / Gemini / Tavily / (optional) Colab. Validates each credential with a live ping. Stores via OS keyring, `.env` fallback. |
-| `prompt2ml doctor` | Hardware + environment scan → `hardware.json`. Probes Docker, image presence, GPU passthrough, disk. Prints a green/yellow/red readiness table with the exact fix for each red row. |
-| `prompt2ml run "<idea>"` | Full pipeline. `--modality`, `--budget`, `--no-gpu`, `--dry-run` overrides. |
+| `prompt2ml init` | One-time setup wizard: Kaggle / HF / Gemini / Tavily / (optional) JarvisLabs, RunPod, Colab. Validates each credential with a live ping. Stores via OS keyring, `.env` fallback. |
+| `prompt2ml doctor` | Hardware + environment scan → `hardware.json`. Probes Docker, image presence, GPU passthrough, disk, remote-provider reachability, and **orphaned leases**. Green/yellow/red readiness table with the exact fix for each red row. |
+| `prompt2ml run "<idea>"` | Full pipeline. `--modality`, `--budget`, `--backend`, `--max-cost-usd`, `--allow-remote`, `--local-only`, `--dry-run`. |
 | `prompt2ml resume [run_id]` | Resumes from the last completed phase in `run.json`. |
-| `prompt2ml status` / `list` | Table of runs, phase, elapsed, artifact counts. |
+| `prompt2ml status` / `list` | Table of runs, phase, elapsed, artifact counts, **live remote instances + accrued cost**. |
 | `prompt2ml report <run_id>` | Opens/exports the bundle. |
-| `prompt2ml clean` | Prunes intermediates, keeps artifacts. |
+| `prompt2ml clean` | Prunes intermediates, keeps artifacts. `--leases` force-terminates orphaned remote instances. |
 
 Rich for tables/progress, Typer for parsing. Live phase progress replaces the current wall
 of `[PIPELINE]` prints; full detail goes to `logs/`.
@@ -322,15 +424,30 @@ Manifest-producing extraction with HF normalization (fixes the broken Arrow path
 *Done when:* `prompt2ml run "classify support tickets by urgency"` produces a fine-tuned
 model + metrics + plots with no manual intervention.
 
-### M5 — Vision pipeline + GPU training *(~2.5 weeks)*
+### M5 — Compute backends: local GPU + JarvisLabs + RunPod *(~2 weeks)*
 
-`pipelines/vision/`, imagefolder adapter, GPU sandbox (or consented host-venv fallback),
-budget-driven model selection, LoRA path for tight VRAM.
+`compute/broker.py`, `compute/leases.py` (TTL supervisor, atexit/signal teardown, orphan
+reconciliation), `backends/local_docker.py` (GPU), `backends/local_venv.py`,
+`backends/jarvislabs.py`, `backends/runpod.py`. Published `prompt2ml-sandbox:{cpu,cuda12}`
+images + remote version-parity verification. Cost estimation, `--max-cost-usd`,
+`--allow-remote` / `--local-only` consent flow.
 
-*Done when:* an image-classification idea trains on the local GPU end to end, and the same
-run degrades gracefully to CPU with a reduced budget when the GPU is unavailable.
+*Done when:* the same training job runs unmodified on all three of local-GPU, JarvisLabs, and
+RunPod; a `SIGINT` mid-training terminates the remote instance within the TTL; and a
+deliberately orphaned instance is detected and offered for cleanup by `doctor`.
 
-### M6 — Deliverable bundle & polish *(~1 week)*
+**This milestone is the one to build with a hard cost ceiling on a throwaway account.** Every
+other milestone fails for free; this one fails with a bill.
+
+### M6 — Vision pipeline + DL training *(~2.5 weeks)*
+
+`pipelines/vision/`, imagefolder adapter, `train_torch` recipes for vision, budget-driven
+model selection, LoRA path for tight VRAM, checkpoint/resume for interruptible instances.
+
+*Done when:* an image-classification idea trains end to end on whichever backend the broker
+selects, and the same run degrades gracefully to a smaller model + reduced budget on CPU.
+
+### M7 — Deliverable bundle & polish *(~1 week)*
 
 Your definition of done, made explicit and verified. Every run ends with:
 
@@ -355,11 +472,15 @@ a new file, which is what makes the output usable rather than just present.
   the debugging surface without adding value.
 - **M1 before M4/M5.** Multi-modality needs the manifest and the run contract; retrofitting
   them later means touching every pipeline twice.
-- **M2/M3 before M4/M5.** The quality gate and research tool are exactly what make generated
+- **M2/M3 before M4-M6.** The quality gate and research tool are exactly what make generated
   *DL* code survivable — DL scripts are longer, slower to fail, and more expensive per
-  failure than sklearn scripts. Build the net before the high wire.
+  failure than sklearn scripts. On rented GPUs, a bad script now costs money per minute.
+  Build the net before the high wire.
 - **Text before vision.** HF is already an integrated source, the data stays rectangular, and
   the failure modes are cheaper to debug than image pipelines.
+- **Compute backends (M5) before vision (M6).** Vision is what actually needs the GPU, and
+  debugging a new pipeline and a new execution backend simultaneously means never knowing
+  which one broke. Land the backends against the already-working text trainer first.
 
 ---
 
@@ -369,7 +490,14 @@ a new file, which is what makes the output usable rather than just present.
    is automatic or prompted.
 2. **Host-venv training consent** — one-time global opt-in during `init`, or per-run
    confirmation? (Recommend: per-run, since it's the only path that drops isolation.)
-3. **Colab's role after local GPU works** — keep as a fallback tier, or drop it? It's
-   currently half-wired (`stop_colab_runtime` can't actually release the runtime).
-4. **Model registry** — do repeated runs on the same dataset accumulate a comparable history,
+3. **Colab's role now that JarvisLabs and RunPod are in** — both are strictly better
+   behaved (real APIs, real teardown, predictable billing). Recommend demoting Colab to
+   "supported if configured, never auto-selected", or dropping it entirely rather than
+   maintaining a third remote path.
+4. **Default disposition on run completion** — PAUSE (fast resume, storage still bills) or
+   DESTROY (zero residual cost, cold start next time)? Recommend DESTROY by default with
+   `--keep-warm` to opt into PAUSE.
+5. **Cost ceiling default** — should `--max-cost-usd` have a non-zero default (e.g. $5) so
+   an unattended run can never surprise you, or default to unlimited with explicit opt-in?
+6. **Model registry** — do repeated runs on the same dataset accumulate a comparable history,
    or is each run standalone?
