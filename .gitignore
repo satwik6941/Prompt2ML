@@ -9,7 +9,10 @@
 __pycache__/
 *.pyc
 .adk
-prompt2ml
+# Local virtualenv at the repo root. Anchored and trailing-slashed on purpose:
+# a bare `prompt2ml` pattern also matches src/prompt2ml/, silently excluding the
+# package itself from the repository.
+/prompt2ml/
 .ruff_cache/
 .pytest_cache/
 .remember
@@ -23,3 +26,8 @@ datasets/
 modified_datasets/
 outputs/
 runs/
+
+# Python packaging artifacts
+*.egg-info/
+build/
+dist/

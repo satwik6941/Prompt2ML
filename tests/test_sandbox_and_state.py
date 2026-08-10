@@ -2,10 +2,8 @@
 Tests for run isolation, sandbox path handling, and state durability.
 """
 
-import json
 
 import pytest
-
 
 # --------------------------------------------------------------------------
 # Run isolation
@@ -54,8 +52,8 @@ def test_sandbox_executor_is_a_single_module_instance():
     independent _container/_started globals — so one phase could believe the
     sandbox was stopped while another still held it.
     """
-    from data_preprocessing_agent import sandbox_executor as pkg_mod
     import machine_learning_agent.agent as ml
+    from data_preprocessing_agent import sandbox_executor as pkg_mod
 
     assert ml.run_in_sandbox.__module__ == pkg_mod.__name__
 
